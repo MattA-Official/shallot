@@ -38,13 +38,13 @@ crate is `crates/abi` (`shallot-abi`).
   system.
 - **The loop (R7).** Bun never calls `app_run`, which blocks the JavaScript event loop. It calls
   `app_frame` in the pumped loop from [02-runtimes.md](02-runtimes.md#the-frame-loop-on-native).
-  This needs `app_frame` to open and service the engine's own window on native, not only to serve
+  The porting plan confirms that `app_frame` services the engine's own window on native, not only
   a browser's `requestAnimationFrame`.
 - **Handles.** Handles and entity references are `u64`, which `bun:ffi` and wasm both surface in
   JavaScript as `BigInt`. The facade converts them to `number` where they fit in 53 bits (index
   plus a generation of 21 bits or fewer), so `materials.add(...)` keeps returning a `number` as it
-  does today. That needs generations to stay within 21 bits, or the facade keeps those handles as
-  `BigInt`.
+  does today. The porting plan fixes handles and entity references at 53 bits or fewer (a 32-bit
+  index plus a wrapping generation of at most 21 bits), so this always holds.
 
 ## Things the binding deliberately does not need
 
