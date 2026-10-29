@@ -278,7 +278,7 @@ fn encode(buf: &mut Vec<u32>, opcode: u16, operands: &[u32]) {
 fn string_words(s: &str) -> Vec<u32> {
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
     bytes
