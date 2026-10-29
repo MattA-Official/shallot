@@ -46,11 +46,11 @@ inside the engine, and this plan wins on anything inside the TypeScript package.
 | # | Decision | Status |
 | --- | --- | --- |
 | D1 | The binding is a client of the same boundary every other language uses. No private back door into the engine. | Agreed (follows Matt's "bindings like Godot") |
-| D2 | Browser: the engine compiles to `wasm32-unknown-unknown`; the binding's JavaScript is also the engine's WebGPU/DOM/audio import glue. No `wasm-bindgen`. | Agreed |
+| D2 | Browser: the engine compiles to `wasm32-unknown-unknown`; the binding's JavaScript is also the engine's WebGPU/DOM/audio import glue. No `wasm-bindgen`. | Proposed |
 | D3 | Native: the user's Bun process loads the engine dynamic library through `bun:ffi`. No embedded JavaScript engine. | Agreed (Q1: Bun only at first) |
-| D4 | Component data lives in engine memory. TypeScript reads and writes it through zero-copy typed-array views, so per-entity access never crosses the boundary. | Agreed |
-| D5 | The TypeScript API surface is generated from a reflection dump the engine emits, then wrapped by a thin hand-written facade. | Agreed |
-| D6 | The binding replaces the current native shell (`crates/native`, wry/winit/CEF). | Agreed |
+| D4 | Component data lives in engine memory. TypeScript reads and writes it through zero-copy typed-array views, so per-entity access never crosses the boundary. | Proposed |
+| D5 | The TypeScript API surface is generated from a reflection dump the engine emits, then wrapped by a thin hand-written facade. | Proposed |
+| D6 | The binding replaces the current native shell (`crates/native`, wry/winit/CEF). | Proposed |
 
-Matt agreed D2 to D6 and the answers to Q1 to Q6 on 2026-10-29; see
+Matt accepted the recommended answers to Q1 to Q6 on 2026-10-29 (which settles D3); see
 [06-roadmap.md](06-roadmap.md#decided-questions).
