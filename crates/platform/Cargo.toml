@@ -1,0 +1,8 @@
+[package]
+name = "shallot-platform"
+description = "Windows, input and timing over raw OS bindings, with no dependencies beyond std."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

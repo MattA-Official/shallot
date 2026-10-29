@@ -1,0 +1,8 @@
+[package]
+name = "shallot-wgsl"
+description = "WGSL front end and SPIR-V back end, with no dependencies beyond std."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

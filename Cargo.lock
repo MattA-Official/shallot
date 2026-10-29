@@ -2802,6 +2802,14 @@ name = "shallot-audio"
 version = "0.10.0"
 
 [[package]]
+name = "shallot-gpu"
+version = "0.10.0"
+dependencies = [
+ "shallot-platform",
+ "shallot-wgsl",
+]
+
+[[package]]
 name = "shallot-native"
 version = "0.10.0"
 dependencies = [
@@ -2820,6 +2828,14 @@ version = "0.10.0"
 dependencies = [
  "serde_json",
 ]
+
+[[package]]
+name = "shallot-platform"
+version = "0.10.0"
+
+[[package]]
+name = "shallot-wgsl"
+version = "0.10.0"
 
 [[package]]
 name = "shlex"
