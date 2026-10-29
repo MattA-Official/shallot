@@ -331,7 +331,7 @@ impl Window {
     pub fn raw_handle(&self) -> RawWindowHandle {
         RawWindowHandle::Xlib {
             display: self.display,
-            window: self.window as u64,
+            window: self.window,
         }
     }
 
@@ -406,7 +406,7 @@ impl Window {
                 let pressed = event.kind == BUTTON_PRESS;
                 match event.pointer.button {
                     // Buttons 4 to 7 are wheel steps and only press.
-                    4 | 5 | 6 | 7 if pressed => {
+                    4..=7 if pressed => {
                         let (x, y) = match event.pointer.button {
                             4 => (0.0, -1.0),
                             5 => (0.0, 1.0),
@@ -451,10 +451,8 @@ impl Window {
                     events.push(Event::Resized { width, height });
                 }
             }
-            CLIENT_MESSAGE => {
-                if event.client.data[0] as Atom == self.wm_delete_window {
-                    events.push(Event::CloseRequested);
-                }
+            CLIENT_MESSAGE if event.client.data[0] as Atom == self.wm_delete_window => {
+                events.push(Event::CloseRequested);
             }
             _ => {}
         }
