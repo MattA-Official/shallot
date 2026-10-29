@@ -91,13 +91,15 @@ examples-rs/<name>/         Rust translations (porting plan; name to be agreed)
 | The facade drifts from the engine as upstream changes | Silent API differences | Tier B and C are generated (R9); a CI check fails if the generated output is stale |
 | No DOM on native | HUD examples are less complete natively | Browser-only HUDs first, engine UI later (Q2) |
 
-## Open questions
+## Decided questions
 
-| ID | Question | Recommendation |
+Matt accepted every recommendation below on 2026-10-29.
+
+| ID | Question | Decision |
 | --- | --- | --- |
 | Q1 | Which native JavaScript runtimes are supported at first? | Bun only. It is already required by the repository, and `bun:ffi` needs no addon. Add Deno or Node later on request. |
 | Q2 | Is "HUD in the browser only" acceptable for the T4 milestone on native? | Yes, with engine-UI HUDs as a follow-up once the Rust examples have them. |
 | Q3 | When is the original TypeScript engine in `src/` deleted? | Keep it as the reference oracle for the screenshot harness and tests until T4, then delete it. |
-| Q4 | What is the npm package called? `@dylanebert/shallot` is upstream's name. | A scope Matt owns, keeping the same subpath exports so only the package name changes in imports. |
+| Q4 | What is the npm package called? `@dylanebert/shallot` is upstream's name. | A scope Matt owns, keeping the same subpath exports so only the package name changes in imports. The exact name is still to be picked before T4. |
 | Q5 | Who owns the wasm import glue (L1)? | Shared: porting step 4 owns the list of imports (R15); this binding owns the JavaScript that implements them. |
 | Q6 | Should Rust apps on the web also use this JavaScript glue? | Yes. A Rust-only web app loads L1 with no TypeScript facade on top. |
