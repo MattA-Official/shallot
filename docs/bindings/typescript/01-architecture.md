@@ -79,9 +79,11 @@ for change detection. The Rust engine keeps the same structure-of-arrays layout.
    The engine bumps the generation; the facade compares on access and rebuilds the view only then.
    In wasm, `memory.grow` also detaches every view, so the transport keeps a single global
    generation that changes on growth.
-4. `.get(eid)` and `.set(eid, v)` are plain typed-array reads and writes plus, for `set`, the same
-   dirty-bit and tick update the TypeScript engine does today, into the engine's bitset memory.
-   No boundary crossing.
+4. `.get(eid)` and `.set(eid, v)` are plain typed-array reads and writes. `set` also appends the
+   entity to a per-field list in TypeScript, which is flushed to the engine's change tracking with
+   one `column_mark` call when the current system returns (see
+   [04-boundary-requirements.md](04-boundary-requirements.md#how-the-binding-uses-the-answers)).
+   No boundary crossing per write.
 5. `column` (the raw typed array) stays available, so code such as
    `input.move.column.slice(eid * 2, eid * 2 + 2)` keeps working unchanged.
 

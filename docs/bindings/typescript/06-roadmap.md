@@ -23,7 +23,8 @@ binding             T0 ─► T1 ──────► T2 ───────�
 ### T0 · Boundary review (during porting step 2)
 
 - Requirements R1 to R15 in [04-boundary-requirements.md](04-boundary-requirements.md) are
-  accepted, changed or rejected by the porting plan, with links.
+  accepted, changed or rejected by the porting plan, with links. (Done 2026-10-29: all answered in
+  `docs/porting/bindings.md`.)
 - The reflection dump format (R9) is agreed and the engine emits a first version.
 - **Done when:** every requirement has a status and a link.
 
@@ -63,11 +64,11 @@ binding             T0 ─► T1 ──────► T2 ───────�
 
 ## Where the code lives
 
-Proposed layout, to be confirmed against the porting plan's crate layout:
+Proposed layout for the binding, beside the porting plan's crates:
 
 ```
-crates/shallot/             the engine (porting plan)
-crates/shallot-boundary/    extern "C" boundary + reflection dump (porting plan, R1–R15)
+crates/…                    the engine (porting plan, see docs/porting/module-map.md)
+crates/abi/                 shallot-abi: boundary! exports + api_description (docs/porting/bindings.md)
 bindings/typescript/
   src/transport/            wasm.ts, ffi.ts            (L2)
   src/host/browser/         WebGPU, input, audio glue  (L1)
