@@ -5,7 +5,7 @@ The engine layer owns domain-free storage and scheduling, the app and plugin lif
 ## Entities
 
 - `Entity` is a `u32` index ("eid"). Indices recycle; a per-index generation tells stale references apart.
-- `EntityRef` packs index and generation into a `u64` (TypeScript packs them into a float64's integer range), survives eid recycling, and is what events and callbacks carry, as today.
+- `EntityRef` packs index and generation into a `u64` that never exceeds 53 bits (32-bit index, generation at most 21 bits, wrapping), the same float64-safe range TypeScript uses, so bindings to JavaScript keep plain numbers. It survives eid recycling, and is what events and callbacks carry, as today.
 - `world.create()`, `destroy`, `exists`, `ref`, `resolve`, `entities()` keep their meaning.
 
 ## Components

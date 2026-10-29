@@ -40,7 +40,7 @@ Grouped by area. Every item lists the TypeScript binding requirement it answers 
 - `app_create(config) -> AppHandle`, `app_dispose`, `app_world(app) -> WorldHandle`.
 - Host-driven stepping: `world_step(world, dt)`, `world_tick(world)`, as headless tests use.
 - Engine-owned loop: `app_run(app)` opens the window and runs until exit, calling host systems as below.
-- `app_frame(app)` runs exactly one frame for hosts that own their loop (the browser's `requestAnimationFrame`).
+- `app_frame(app)` runs exactly one frame for hosts that own their loop. It works with the engine-owned window on native as well as in the browser: a host whose runtime must not block (Bun, whose promises and asset loads need the JS event loop) pumps `app_frame` from its main thread instead of calling `app_run`. In the browser, `requestAnimationFrame` drives it.
 
 ### Components (R1, R2)
 
@@ -107,7 +107,7 @@ shallot_abi::boundary! {
 }
 ```
 
-`boundary!` is a `macro_rules!` macro that generates, for each function: the `extern "C"` export with `#[no_mangle]` and the `shallot_` prefix, panic catching and `Status` conversion, argument checks (null pointers, lengths, handle generations), the `Api` table entry, and the function's entry in the reflection document. Handles are `u64` with an index and generation so a stale handle is an error, not undefined behaviour.
+`boundary!` is a `macro_rules!` macro that generates, for each function: the `extern "C"` export with `#[no_mangle]` and the `shallot_` prefix, panic catching and `Status` conversion, argument checks (null pointers, lengths, handle generations), the `Api` table entry, and the function's entry in the reflection document. Handles are `u64` with an index and generation so a stale handle is an error, not undefined behaviour. Handles and entity refs keep index plus generation within 53 bits (32-bit index, generation at most 21 bits, wrapping), so hosts whose numbers are IEEE doubles (JavaScript) can hold them as plain numbers rather than BigInt.
 
 ## What is not in the boundary
 
@@ -117,4 +117,4 @@ shallot_abi::boundary! {
 
 ## TypeScript binding
 
-Placeholder. A separate planning thread owns it and writes `docs/bindings/typescript/`. Its requirements on this boundary (R1–R15) are answered above; disagreements are settled in that plan and reflected back here.
+Planned separately in [docs/bindings/typescript/README.md](../bindings/typescript/README.md). Its requirements on this boundary (R1–R15, in `04-boundary-requirements.md` there) are answered above; disagreements are settled in that plan and reflected back here.
