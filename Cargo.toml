@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/audio", "crates/native", "crates/physics"]
+members = [
+    "crates/audio",
+    "crates/gpu",
+    "crates/native",
+    "crates/physics",
+    "crates/platform",
+    "crates/wgsl",
+]
 resolver = "2"
 
 [workspace.package]
