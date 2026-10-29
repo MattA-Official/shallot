@@ -1,0 +1,10 @@
+[package]
+name = "shallot-gpu"
+description = "A WebGPU-shaped GPU API over Vulkan, with no dependencies beyond std and the sibling shallot crates."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shallot-platform = { path = "../platform" }
+shallot-wgsl = { path = "../wgsl" }
