@@ -1,0 +1,64 @@
+name: port
+
+# The Rust port's own checks, kept apart from upstream's test.yml so upstream merges stay clean.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: port-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PORT_CRATES: shallot-platform shallot-wgsl shallot-gpu
+
+jobs:
+  linux:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          rustflags: ""
+      - name: install Mesa Vulkan driver, validation layers and SPIR-V tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers spirv-tools libx11-6 xvfb
+      - name: dependency gate (std and OS bindings only)
+        run: |
+          status=0
+          for crate in $PORT_CRATES; do
+            extra=$(cargo tree -p "$crate" -e normal,build --prefix none | grep -v '^shallot' || true)
+            if [ -n "$extra" ]; then
+              echo "::error::$crate depends on crates outside the workspace:"
+              echo "$extra"
+              status=1
+            fi
+          done
+          exit $status
+      - name: format
+        run: for crate in $PORT_CRATES; do cargo fmt -p "$crate" --check; done
+      - name: clippy
+        run: cargo clippy $(printf -- '-p %s ' $PORT_CRATES) --all-targets -- -D warnings
+      - name: tests (under the Vulkan validation layers)
+        env:
+          SHALLOT_GPU_VALIDATION: "1"
+        run: cargo test $(printf -- '-p %s ' $PORT_CRATES)
+      - name: triangle example, headless and windowed
+        env:
+          SHALLOT_GPU_VALIDATION: "1"
+        run: |
+          cargo run -p shallot-gpu --example triangle -- --headless triangle.png
+          xvfb-run -a cargo run -p shallot-gpu --example triangle -- --frames 120
+      - uses: actions/upload-artifact@v7
+        with:
+          name: triangle
+          path: triangle.png
