@@ -76,6 +76,24 @@ impl Surface {
                     "vkCreateXlibSurfaceKHR",
                 )?;
             }
+            RawWindowHandle::Win32 { hinstance, hwnd } => {
+                let Some(win32) = &instance.win32_surface else {
+                    return Err(GpuError::Internal(
+                        "the Vulkan driver does not support Win32 surfaces".into(),
+                    ));
+                };
+                let info = vk::Win32SurfaceCreateInfoKHR {
+                    s_type: vk::STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    flags: 0,
+                    hinstance,
+                    hwnd,
+                };
+                check(
+                    (win32.create_win32_surface)(instance.raw, &info, std::ptr::null(), &mut raw),
+                    "vkCreateWin32SurfaceKHR",
+                )?;
+            }
         }
         Ok(Surface {
             shared: Arc::new(SurfaceShared {

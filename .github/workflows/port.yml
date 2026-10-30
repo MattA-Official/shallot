@@ -62,3 +62,46 @@ jobs:
         with:
           name: triangle
           path: triangle.png
+
+  windows:
+    # Native Windows: the Win32 backend's build, lints and tests, including a real window.
+    # The runner has no Vulkan loader, so GPU tests skip here; the wine job runs them.
+    timeout-minutes: 20
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          rustflags: ""
+      - name: clippy
+        shell: bash
+        run: cargo clippy $(printf -- '-p %s ' $PORT_CRATES) --all-targets -- -D warnings
+      - name: tests
+        shell: bash
+        run: cargo test $(printf -- '-p %s ' $PORT_CRATES)
+
+  wine:
+    # The Windows build on Vulkan: Wine's winevulkan forwards to Mesa's lavapipe, so the GPU
+    # tests and the windowed triangle exercise the Win32 window and VK_KHR_win32_surface.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: wine
+      WINEDEBUG: -all
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-gnu
+          rustflags: ""
+      - name: install Wine, MinGW and Mesa's Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wine64 gcc-mingw-w64-x86-64 mesa-vulkan-drivers xvfb
+      - name: tests
+        run: xvfb-run -a cargo test --target x86_64-pc-windows-gnu $(printf -- '-p %s ' $PORT_CRATES)
+      - name: triangle example, headless and windowed
+        run: |
+          cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --headless triangle.png
+          xvfb-run -a cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --frames 120
