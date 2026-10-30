@@ -5,9 +5,10 @@
 //! WGSL shaders are compiled with `shallot-wgsl`. Nothing beyond `std` is used: the Vulkan
 //! loader is opened at run time.
 //!
-//! What is implemented so far is the path a triangle needs (see `docs/porting/gpu.md`,
-//! milestone 1): instance, adapter, device, queue, buffers, textures and views, shader modules,
-//! render pipelines, render passes, copies, mapping, error scopes and presentation.
+//! Implemented so far (see `docs/porting/gpu.md`): instance, adapter, device, queue, buffers,
+//! textures and views, samplers, bind groups and their layouts (explicit and `"auto"`), shader
+//! modules, render and compute pipelines, render and compute passes with indirect draws and
+//! dispatches, copies, mapping, error scopes and presentation.
 //!
 //! ```no_run
 //! use shallot_gpu::*;
@@ -36,8 +37,8 @@ pub use executor::block_on;
 pub use shallot_platform::RawWindowHandle;
 pub use types::*;
 pub use vulkan::{
-    Adapter, Buffer, BufferView, BufferViewMut, CommandBuffer, CommandEncoder, Device, Instance,
-    MapFuture, PipelineLayout, PipelineLayoutDescriptor, PollType, Queue, RenderPassEncoder,
-    RenderPipeline, ShaderModule, Surface, SurfaceCapabilities, SurfaceTexture, Texture,
-    TextureView,
+    Adapter, BindGroup, BindGroupLayout, Buffer, BufferView, BufferViewMut, CommandBuffer,
+    CommandEncoder, ComputePassEncoder, ComputePipeline, Device, Instance, MapFuture,
+    PipelineLayout, PollType, Queue, RenderPassEncoder, RenderPipeline, Sampler, ShaderModule,
+    Surface, SurfaceCapabilities, SurfaceTexture, Texture, TextureView,
 };

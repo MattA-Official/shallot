@@ -160,3 +160,75 @@ fn expressions() {
         "#,
     );
 }
+
+#[test]
+fn textures_and_samplers() {
+    validate(
+        "textures",
+        r#"
+        @group(0) @binding(0) var color: texture_2d<f32>;
+        @group(0) @binding(1) var layers: texture_2d_array<f32>;
+        @group(0) @binding(2) var sky: texture_cube<f32>;
+        @group(0) @binding(3) var volume: texture_3d<f32>;
+        @group(0) @binding(4) var shadow: texture_depth_2d_array;
+        @group(0) @binding(5) var ids: texture_2d<u32>;
+        @group(0) @binding(6) var msaa: texture_multisampled_2d<f32>;
+        @group(0) @binding(7) var line: texture_1d<f32>;
+        @group(1) @binding(0) var linear: sampler;
+        @group(1) @binding(1) var compare: sampler_comparison;
+
+        fn fetch_id(t: texture_2d<u32>, p: vec2i) -> u32 {
+            return textureLoad(t, p, 0).x;
+        }
+
+        @fragment
+        fn fs(@builtin(position) pos: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
+            var c = textureSample(color, linear, uv);
+            c += textureSample(color, linear, uv, vec2i(1, -1));
+            c += textureSampleBias(layers, linear, uv, 2, 0.5);
+            c += textureSampleLevel(sky, linear, vec3f(uv, 1.0), 0.0);
+            c += textureSampleGrad(volume, linear, vec3f(uv, 0.5), vec3f(0.1), vec3f(0.1));
+            c += textureGather(1, color, linear, uv);
+            c += textureGatherCompare(shadow, compare, uv, 1u, 0.5);
+            c += textureSampleLevel(line, linear, uv.x, 0.0);
+            let s = textureSampleCompare(shadow, compare, uv, 0, 0.5)
+                + textureSampleCompareLevel(shadow, compare, uv, 1, 0.25, vec2i(2, 2))
+                + textureSampleLevel(shadow, linear, uv, 0, 0);
+            let p = vec2i(pos.xy);
+            c += textureLoad(color, p, 1) + textureLoad(msaa, p, 3);
+            let size = textureDimensions(color) + textureDimensions(color, 1u)
+                + textureDimensions(layers) + textureDimensions(sky);
+            let counts = textureNumLayers(layers) + textureNumLevels(color)
+                + textureNumSamples(msaa) + textureDimensions(volume).z + textureDimensions(line);
+            return c * s + vec4f(f32(size.x + counts + fetch_id(ids, p)));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn storage_textures() {
+    validate(
+        "storage_textures",
+        r#"
+        @group(0) @binding(0) var src: texture_storage_2d<rgba8unorm, read>;
+        @group(0) @binding(1) var dst: texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(2) var counts: texture_storage_2d_array<r32uint, read_write>;
+        @group(0) @binding(3) var wide: texture_storage_3d<rg32float, write>;
+        @group(0) @binding(4) var line: texture_storage_1d<rgba32sint, write>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) id: vec3u) {
+            let p = vec2u(id.xy);
+            let texel = textureLoad(src, p);
+            textureStore(dst, p, texel * 2.0);
+            let n = textureLoad(counts, vec2i(p), 1).x;
+            textureStore(counts, p, 1u, vec4u(n + 1u));
+            textureStore(wide, id, vec4f(1.0));
+            textureStore(line, i32(id.x), vec4i(-1));
+            let size = textureDimensions(dst) + textureDimensions(counts) + vec2u(textureNumLayers(counts));
+            textureStore(dst, size - 1u, vec4f(0.0));
+        }
+        "#,
+    );
+}
