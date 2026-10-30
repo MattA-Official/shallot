@@ -102,6 +102,8 @@ jobs:
       - name: tests
         run: xvfb-run -a cargo test --target x86_64-pc-windows-gnu $(printf -- '-p %s ' $PORT_CRATES)
       - name: triangle example, headless and windowed
+        # Wine reaches the host's Vulkan through its X11 driver, so even headless runs need a
+        # display.
         run: |
-          cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --headless triangle.png
+          xvfb-run -a cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --headless triangle.png
           xvfb-run -a cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --frames 120
