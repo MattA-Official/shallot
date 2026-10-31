@@ -86,6 +86,9 @@ mod op {
     pub const TYPE_ARRAY: u16 = 28;
     pub const TYPE_RUNTIME_ARRAY: u16 = 29;
     pub const TYPE_STRUCT: u16 = 30;
+    pub const TYPE_IMAGE: u16 = 25;
+    pub const TYPE_SAMPLER: u16 = 26;
+    pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const TYPE_POINTER: u16 = 32;
     pub const TYPE_FUNCTION: u16 = 33;
     pub const CONSTANT_TRUE: u16 = 41;
@@ -108,6 +111,20 @@ mod op {
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
     pub const TRANSPOSE: u16 = 84;
+    pub const SAMPLED_IMAGE: u16 = 86;
+    pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+    pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+    pub const IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
+    pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
+    pub const IMAGE_FETCH: u16 = 95;
+    pub const IMAGE_GATHER: u16 = 96;
+    pub const IMAGE_DREF_GATHER: u16 = 97;
+    pub const IMAGE_READ: u16 = 98;
+    pub const IMAGE_WRITE: u16 = 99;
+    pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_QUERY_SIZE: u16 = 104;
+    pub const IMAGE_QUERY_LEVELS: u16 = 106;
+    pub const IMAGE_QUERY_SAMPLES: u16 = 107;
     pub const CONVERT_F_TO_U: u16 = 109;
     pub const CONVERT_F_TO_S: u16 = 110;
     pub const CONVERT_S_TO_F: u16 = 111;
@@ -276,6 +293,7 @@ mod decoration {
     pub const CENTROID: u32 = 16;
     pub const SAMPLE: u32 = 17;
     pub const NON_WRITABLE: u32 = 24;
+    pub const NON_READABLE: u32 = 25;
     pub const LOCATION: u32 = 30;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
@@ -299,7 +317,64 @@ mod builtin {
 }
 
 const CAPABILITY_SHADER: u32 = 1;
+const CAPABILITY_IMAGE_GATHER_EXTENDED: u32 = 25;
 const CAPABILITY_SAMPLE_RATE_SHADING: u32 = 35;
+const CAPABILITY_SAMPLED_1D: u32 = 43;
+const CAPABILITY_IMAGE_1D: u32 = 44;
+const CAPABILITY_SAMPLED_CUBE_ARRAY: u32 = 45;
+const CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49;
+const CAPABILITY_IMAGE_QUERY: u32 = 50;
+const CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
+
+/// Image operand mask bits, in the order their operands follow.
+mod image_operand {
+    pub const BIAS: u32 = 0x1;
+    pub const LOD: u32 = 0x2;
+    pub const GRAD: u32 = 0x4;
+    pub const CONST_OFFSET: u32 = 0x8;
+    pub const SAMPLE: u32 = 0x40;
+}
+
+/// The SPIR-V `ImageFormat` of a WGSL storage texel format, and whether it needs the
+/// `StorageImageExtendedFormats` capability. `bgra8unorm` has no SPIR-V format and is declared
+/// `Unknown`, read and written without a format.
+fn image_format(format: &str) -> (u32, bool) {
+    match format {
+        "rgba32float" => (1, false),
+        "rgba16float" => (2, false),
+        "r32float" => (3, false),
+        "rgba8unorm" => (4, false),
+        "rgba8snorm" => (5, false),
+        "rg32float" => (6, true),
+        "rg16float" => (7, true),
+        "rg11b10ufloat" => (8, true),
+        "r16float" => (9, true),
+        "rgb10a2unorm" => (11, true),
+        "rg8unorm" => (13, true),
+        "r8unorm" => (15, true),
+        "rgba32sint" => (21, false),
+        "rgba16sint" => (22, false),
+        "rgba8sint" => (23, false),
+        "r32sint" => (24, false),
+        "rg32sint" => (25, true),
+        "rg16sint" => (26, true),
+        "rg8sint" => (27, true),
+        "r16sint" => (28, true),
+        "r8sint" => (29, true),
+        "rgba32uint" => (30, false),
+        "rgba16uint" => (31, false),
+        "rgba8uint" => (32, false),
+        "r32uint" => (33, false),
+        "rgb10a2uint" => (34, true),
+        "rg32uint" => (35, true),
+        "rg16uint" => (36, true),
+        "rg8uint" => (37, true),
+        "r16uint" => (38, true),
+        "r8uint" => (39, true),
+        _ => (0, false),
+    }
+}
 
 fn encode(buf: &mut Vec<u32>, opcode: u16, operands: &[u32]) {
     buf.push(((operands.len() as u32 + 1) << 16) | opcode as u32);
@@ -377,6 +452,8 @@ struct Writer<'m> {
     /// Types reachable from uniform and storage buffers, the only ones given an explicit
     /// layout: Vulkan forbids `Offset` and `ArrayStride` on types in other storage classes.
     laid_out: std::collections::HashSet<Type>,
+    /// `OpTypeSampledImage` for each image type.
+    sampled_images: HashMap<u32, u32>,
     f: FnState,
 }
 
@@ -403,6 +480,7 @@ impl<'m> Writer<'m> {
             current_fn: 0,
             blocks: BTreeSet::new(),
             laid_out: laid_out_types(module),
+            sampled_images: HashMap::new(),
             f: FnState::default(),
         }
     }
@@ -477,6 +555,27 @@ impl<'m> Writer<'m> {
         };
         if let Type::Atomic(s) = &ty {
             return self.type_id(&Type::Scalar(*s));
+        }
+        // WGSL types that differ only in what SPIR-V does not encode share one declaration.
+        match &ty {
+            Type::Sampler { comparison: true } => {
+                return self.type_id(&Type::Sampler { comparison: false })
+            }
+            Type::Texture {
+                dim,
+                arrayed,
+                kind: TextureKind::Storage { format, access },
+            } if *access != Access::ReadWrite => {
+                return self.type_id(&Type::Texture {
+                    dim: *dim,
+                    arrayed: *arrayed,
+                    kind: TextureKind::Storage {
+                        format: format.clone(),
+                        access: Access::ReadWrite,
+                    },
+                })
+            }
+            _ => {}
         }
         if let Some(&id) = self.types.get(&ty) {
             return Ok(id);
@@ -576,9 +675,12 @@ impl<'m> Writer<'m> {
                 let pointee = self.type_id(pointee)?;
                 self.pointer(storage_class(*space), pointee)
             }
-            Type::Sampler { .. } | Type::Texture { .. } => {
-                return unsupported("textures and samplers")
+            Type::Sampler { .. } => {
+                let id = self.id();
+                encode(&mut self.declarations, op::TYPE_SAMPLER, &[id]);
+                id
             }
+            Type::Texture { dim, arrayed, kind } => self.image_type(*dim, *arrayed, kind)?,
             Type::Atomic(_) => unreachable!(),
         };
         self.types.insert(ty, id);
@@ -772,6 +874,28 @@ impl<'m> Writer<'m> {
         if let Some((group, binding)) = global.group_binding {
             self.decorate(id, decoration::DESCRIPTOR_SET, &[group]);
             self.decorate(id, decoration::BINDING, &[binding]);
+        }
+        if let Type::Texture {
+            kind: TextureKind::Storage { access, format },
+            ..
+        } = &global.ty
+        {
+            // Formats SPIR-V cannot name (bgra8unorm) are read and written without one.
+            if image_format(format).0 == 0 {
+                if *access != Access::Write {
+                    self.capabilities
+                        .insert(CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
+                }
+                if *access != Access::Read {
+                    self.capabilities
+                        .insert(CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+                }
+            }
+            match access {
+                Access::Read => self.decorate(id, decoration::NON_WRITABLE, &[]),
+                Access::Write => self.decorate(id, decoration::NON_READABLE, &[]),
+                Access::ReadWrite => {}
+            }
         }
         debug_assert_eq!(self.globals.len(), index);
         self.globals.push(GlobalVar { id, wrapped });
@@ -1713,6 +1837,9 @@ impl<'m> Writer<'m> {
         if f == ArrayLength {
             return self.array_length(&args[0]);
         }
+        if f.is_texture() {
+            return self.texture(f, args, ret);
+        }
         let ids: Vec<u32> = args.iter().map(|a| self.expr(a)).collect::<Result<_>>()?;
         let ty = self.type_id(ret)?;
         let arg_ty = args.first().map(|a| a.ty.clone()).unwrap_or(Type::Void);
@@ -1856,6 +1983,348 @@ impl<'m> Writer<'m> {
             }
             _ => return unsupported(&format!("{f:?}")),
         })
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Textures
+
+    fn image_type(&mut self, dim: TextureDim, arrayed: bool, kind: &TextureKind) -> Result<u32> {
+        let (scalar, depth, multisampled, sampled, format) = match kind {
+            TextureKind::Sampled {
+                sampled,
+                multisampled,
+            } => (*sampled, 0, *multisampled, 1, 0),
+            TextureKind::Depth { multisampled } => (Scalar::F32, 1, *multisampled, 1, 0),
+            TextureKind::Storage { format, .. } => {
+                let (spirv, extended) = image_format(format);
+                if extended {
+                    self.capabilities
+                        .insert(CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS);
+                }
+                (texel_format_scalar(format).unwrap(), 0, false, 2, spirv)
+            }
+            TextureKind::External => return unsupported("external textures"),
+        };
+        let spirv_dim = match dim {
+            TextureDim::D1 => {
+                self.capabilities.insert(if sampled == 1 {
+                    CAPABILITY_SAMPLED_1D
+                } else {
+                    CAPABILITY_IMAGE_1D
+                });
+                0
+            }
+            TextureDim::D2 => 1,
+            TextureDim::D3 => 2,
+            TextureDim::Cube => {
+                if arrayed {
+                    self.capabilities.insert(CAPABILITY_SAMPLED_CUBE_ARRAY);
+                }
+                3
+            }
+        };
+        let scalar_ty = self.type_id(&Type::Scalar(scalar))?;
+        let id = self.id();
+        encode(
+            &mut self.declarations,
+            op::TYPE_IMAGE,
+            &[
+                id,
+                scalar_ty,
+                spirv_dim,
+                depth,
+                arrayed as u32,
+                multisampled as u32,
+                sampled,
+                format,
+            ],
+        );
+        Ok(id)
+    }
+
+    fn sampled_image_type(&mut self, image: u32) -> u32 {
+        if let Some(&id) = self.sampled_images.get(&image) {
+            return id;
+        }
+        let id = self.id();
+        encode(&mut self.declarations, op::TYPE_SAMPLED_IMAGE, &[id, image]);
+        self.sampled_images.insert(image, id);
+        id
+    }
+
+    /// Emits `opcode` with a result of type `ty` and returns the result id.
+    fn op(&mut self, opcode: u16, ty: u32, operands: &[u32]) -> u32 {
+        let id = self.id();
+        let mut all = vec![ty, id];
+        all.extend_from_slice(operands);
+        self.emit(opcode, &all);
+        id
+    }
+
+    /// Appends the array index to a coordinate, converted to the coordinate's scalar type.
+    fn with_layer(
+        &mut self,
+        coords: u32,
+        coords_ty: &Type,
+        layer: Option<(u32, &Type)>,
+    ) -> Result<(u32, Type)> {
+        let Some((layer, layer_ty)) = layer else {
+            return Ok((coords, coords_ty.clone()));
+        };
+        let scalar = scalar_of(coords_ty);
+        let layer = self.convert_ids(layer_ty, layer, &Type::Scalar(scalar))?;
+        let n = coords_ty.vector_size().unwrap_or(1) + 1;
+        let ty = Type::Vector(n, scalar);
+        let ty_id = self.type_id(&ty)?;
+        Ok((
+            self.op(op::COMPOSITE_CONSTRUCT, ty_id, &[coords, layer]),
+            ty,
+        ))
+    }
+
+    fn u32_min(&mut self, ty: &Type, a: u32, b: u32) -> Result<u32> {
+        let ty_id = self.type_id(ty)?;
+        Ok(self.ext(ty_id, glsl::U_MIN, &[a, b]))
+    }
+
+    /// `x - 1` for a `u32` scalar or vector, used to turn sizes and counts into maximum indices.
+    fn minus_one(&mut self, ty: &Type, x: u32) -> Result<u32> {
+        let one = self.constant_like(ConstValue::Int(1), ty)?;
+        let ty_id = self.type_id(ty)?;
+        Ok(self.op(op::I_SUB, ty_id, &[x, one]))
+    }
+
+    /// Clamps `x` (an `i32` or `u32` scalar or vector) to `0..=max` as `u32`: negative values
+    /// wrap to large unsigned ones and clamp to `max`, which WebGPU's robustness rules allow.
+    fn clamp_index(&mut self, x: u32, x_ty: &Type, max: u32) -> Result<(u32, Type)> {
+        let unsigned = x_ty.with_scalar(Scalar::U32);
+        let x = self.convert_ids(x_ty, x, &unsigned)?;
+        Ok((self.u32_min(&unsigned, x, max)?, unsigned))
+    }
+
+    fn texture(&mut self, f: BuiltinFn, args: &[Expr], ret: &Type) -> Result<u32> {
+        use BuiltinFn::*;
+        let all_ids: Vec<u32> = args.iter().map(|a| self.expr(a)).collect::<Result<_>>()?;
+        let ret_id = self.type_id(ret)?;
+        // textureGather on a colour texture leads with the component.
+        let skip = (f == TextureGather && matches!(args[0].ty, Type::Scalar(_))) as usize;
+        let (args, ids) = (&args[skip..], &all_ids[skip..]);
+        let Type::Texture { dim, arrayed, kind } = &args[0].ty else {
+            unreachable!("checked texture argument")
+        };
+        let (dim, arrayed, kind) = (*dim, *arrayed, kind.clone());
+        let image = ids[0];
+        let image_ty = self.type_id(&args[0].ty)?;
+        let depth = matches!(kind, TextureKind::Depth { .. });
+        let multisampled = matches!(
+            kind,
+            TextureKind::Sampled {
+                multisampled: true,
+                ..
+            } | TextureKind::Depth { multisampled: true }
+        );
+        let storage = matches!(kind, TextureKind::Storage { .. });
+        let has_levels = !storage && !multisampled;
+        let size_ty = match dim.extent() + arrayed as u8 {
+            1 => U32,
+            n => Type::Vector(n, Scalar::U32),
+        };
+
+        match f {
+            TextureSample
+            | TextureSampleBias
+            | TextureSampleLevel
+            | TextureSampleGrad
+            | TextureSampleCompare
+            | TextureSampleCompareLevel
+            | TextureGather
+            | TextureGatherCompare => {
+                let sampled_ty = self.sampled_image_type(image_ty);
+                let sampled = self.op(op::SAMPLED_IMAGE, sampled_ty, &[image, ids[1]]);
+                let layer = arrayed.then(|| (ids[3], &args[3].ty));
+                let (coords, _) = self.with_layer(ids[2], &args[2].ty, layer)?;
+                let mut next = 3 + arrayed as usize;
+                let mut mask = 0;
+                let mut operands = Vec::new();
+                let mut dref = 0;
+                match f {
+                    TextureSampleBias => {
+                        mask |= image_operand::BIAS;
+                        operands.push(ids[next]);
+                        next += 1;
+                    }
+                    TextureSampleLevel => {
+                        let lod = self.convert_ids(&args[next].ty, ids[next], &F32)?;
+                        mask |= image_operand::LOD;
+                        operands.push(lod);
+                        next += 1;
+                    }
+                    TextureSampleGrad => {
+                        mask |= image_operand::GRAD;
+                        operands.extend([ids[next], ids[next + 1]]);
+                        next += 2;
+                    }
+                    TextureSampleCompare | TextureGatherCompare => {
+                        dref = ids[next];
+                        next += 1;
+                    }
+                    TextureSampleCompareLevel => {
+                        dref = ids[next];
+                        next += 1;
+                        mask |= image_operand::LOD;
+                        operands.push(self.constant(&ConstValue::Float(0.0), &F32)?);
+                    }
+                    _ => {}
+                }
+                if next < args.len() {
+                    mask |= image_operand::CONST_OFFSET;
+                    operands.push(ids[next]);
+                    if matches!(f, TextureGather | TextureGatherCompare) {
+                        self.capabilities.insert(CAPABILITY_IMAGE_GATHER_EXTENDED);
+                    }
+                }
+                let mut tail = Vec::new();
+                if mask != 0 {
+                    tail.push(mask);
+                    tail.extend(operands);
+                }
+                let operands = |head: &[u32]| -> Vec<u32> {
+                    let mut all = head.to_vec();
+                    all.extend(&tail);
+                    all
+                };
+                Ok(match f {
+                    TextureGather => {
+                        let component = if skip == 1 {
+                            // A constant: the checker requires one, and SPIR-V does too.
+                            all_ids[0]
+                        } else {
+                            self.u32_const(0)
+                        };
+                        self.op(
+                            op::IMAGE_GATHER,
+                            ret_id,
+                            &operands(&[sampled, coords, component]),
+                        )
+                    }
+                    TextureGatherCompare => self.op(
+                        op::IMAGE_DREF_GATHER,
+                        ret_id,
+                        &operands(&[sampled, coords, dref]),
+                    ),
+                    TextureSampleCompare => self.op(
+                        op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD,
+                        ret_id,
+                        &operands(&[sampled, coords, dref]),
+                    ),
+                    TextureSampleCompareLevel => self.op(
+                        op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+                        ret_id,
+                        &operands(&[sampled, coords, dref]),
+                    ),
+                    _ => {
+                        let opcode = if matches!(f, TextureSample | TextureSampleBias) {
+                            op::IMAGE_SAMPLE_IMPLICIT_LOD
+                        } else {
+                            op::IMAGE_SAMPLE_EXPLICIT_LOD
+                        };
+                        let vec4 = self.type_id(&Type::Vector(4, Scalar::F32))?;
+                        let texel = self.op(opcode, vec4, &operands(&[sampled, coords]));
+                        if depth {
+                            self.op(op::COMPOSITE_EXTRACT, ret_id, &[texel, 0])
+                        } else {
+                            texel
+                        }
+                    }
+                })
+            }
+            TextureLoad | TextureStore => {
+                self.capabilities.insert(CAPABILITY_IMAGE_QUERY);
+                let layer = arrayed.then(|| (ids[2], &args[2].ty));
+                let (coords, coords_ty) = self.with_layer(ids[1], &args[1].ty, layer)?;
+                let next = 2 + arrayed as usize;
+                let size_id = self.type_id(&size_ty)?;
+                let u32_ty = self.type_id(&U32)?;
+                let mut image_operands = Vec::new();
+                let size = if has_levels {
+                    let levels = self.op(op::IMAGE_QUERY_LEVELS, u32_ty, &[image]);
+                    let max_level = self.minus_one(&U32, levels)?;
+                    let (level, _) = self.clamp_index(ids[next], &args[next].ty, max_level)?;
+                    image_operands = vec![image_operand::LOD, level];
+                    self.op(op::IMAGE_QUERY_SIZE_LOD, size_id, &[image, level])
+                } else {
+                    if multisampled {
+                        let samples = self.op(op::IMAGE_QUERY_SAMPLES, u32_ty, &[image]);
+                        let max_sample = self.minus_one(&U32, samples)?;
+                        let (sample, _) =
+                            self.clamp_index(ids[next], &args[next].ty, max_sample)?;
+                        image_operands = vec![image_operand::SAMPLE, sample];
+                    }
+                    self.op(op::IMAGE_QUERY_SIZE, size_id, &[image])
+                };
+                let max = self.minus_one(&size_ty, size)?;
+                let (coords, _) = self.clamp_index(coords, &coords_ty, max)?;
+                if f == TextureStore {
+                    let value = ids[args.len() - 1];
+                    self.emit(op::IMAGE_WRITE, &[image, coords, value]);
+                    return Ok(0);
+                }
+                let mut operands = vec![image, coords];
+                operands.extend(image_operands);
+                if storage {
+                    return Ok(self.op(op::IMAGE_READ, ret_id, &operands));
+                }
+                let texel_ty = if depth {
+                    self.type_id(&Type::Vector(4, Scalar::F32))?
+                } else {
+                    ret_id
+                };
+                let texel = self.op(op::IMAGE_FETCH, texel_ty, &operands);
+                Ok(if depth {
+                    self.op(op::COMPOSITE_EXTRACT, ret_id, &[texel, 0])
+                } else {
+                    texel
+                })
+            }
+            TextureDimensions | TextureNumLayers => {
+                self.capabilities.insert(CAPABILITY_IMAGE_QUERY);
+                let size_id = self.type_id(&size_ty)?;
+                let size = if has_levels {
+                    let level = match ids.get(1) {
+                        Some(&level) => {
+                            let u32_ty = self.type_id(&U32)?;
+                            let levels = self.op(op::IMAGE_QUERY_LEVELS, u32_ty, &[image]);
+                            let max_level = self.minus_one(&U32, levels)?;
+                            self.clamp_index(level, &args[1].ty, max_level)?.0
+                        }
+                        None => self.u32_const(0),
+                    };
+                    self.op(op::IMAGE_QUERY_SIZE_LOD, size_id, &[image, level])
+                } else {
+                    self.op(op::IMAGE_QUERY_SIZE, size_id, &[image])
+                };
+                let n = size_ty.vector_size().unwrap_or(1) as u32;
+                Ok(match (f, arrayed) {
+                    (TextureNumLayers, _) => self.op(op::COMPOSITE_EXTRACT, ret_id, &[size, n - 1]),
+                    (_, false) => size,
+                    (_, true) if n == 2 => self.op(op::COMPOSITE_EXTRACT, ret_id, &[size, 0]),
+                    (_, true) => {
+                        let mut operands = vec![size, size];
+                        operands.extend(0..n - 1);
+                        self.op(op::VECTOR_SHUFFLE, ret_id, &operands)
+                    }
+                })
+            }
+            TextureNumLevels => {
+                self.capabilities.insert(CAPABILITY_IMAGE_QUERY);
+                Ok(self.op(op::IMAGE_QUERY_LEVELS, ret_id, &[image]))
+            }
+            TextureNumSamples => {
+                self.capabilities.insert(CAPABILITY_IMAGE_QUERY);
+                Ok(self.op(op::IMAGE_QUERY_SAMPLES, ret_id, &[image]))
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn array_length(&mut self, pointer: &Expr) -> Result<u32> {

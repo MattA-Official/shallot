@@ -932,6 +932,9 @@ impl<'a> Checker<'a> {
                     let Some(format) = self.template_word(id, 0)? else {
                         return err("storage textures need a texel format", id.span);
                     };
+                    if texel_format_scalar(format).is_none() {
+                        return err(format!("unknown texel format `{format}`"), id.span);
+                    }
                     let access = match self.template_word(id, 1)? {
                         Some("read") => Access::Read,
                         Some("write") => Access::Write,
@@ -1908,6 +1911,9 @@ impl<'a> Checker<'a> {
     fn builtin(&mut self, f: BuiltinFn, args: Vec<Expr>, span: Span) -> Result<Expr> {
         use BuiltinFn::*;
         let args: Vec<Expr> = args.into_iter().map(|a| self.value(a)).collect();
+        if f.is_texture() {
+            return self.texture_builtin(f, args, span);
+        }
         let arity = |n: usize| -> Result<()> {
             if args.len() == n {
                 Ok(())
@@ -2192,6 +2198,277 @@ impl<'a> Checker<'a> {
                     reference: None,
                 })
             }
+            _ => unreachable!("texture builtins are checked by texture_builtin"),
+        }
+    }
+
+    /// Checks a texture builtin. Arguments are kept in WGSL order, concretized to the types the
+    /// back ends expect: `f32` coordinates for sampling, `i32` or `u32` for texel addresses.
+    fn texture_builtin(&mut self, f: BuiltinFn, args: Vec<Expr>, span: Span) -> Result<Expr> {
+        use BuiltinFn::*;
+        let mut args = args.into_iter();
+        let mut out = Vec::new();
+        // textureGather on a colour texture leads with the component to gather.
+        let gather_component = f == TextureGather
+            && !matches!(
+                args.as_slice().get(1).map(|a| &a.ty),
+                Some(Type::Texture {
+                    kind: TextureKind::Depth { .. },
+                    ..
+                })
+            )
+            && args.len() >= 4;
+        if gather_component {
+            let component = self.int_arg(args.next().unwrap(), span)?;
+            match component.as_const() {
+                Some(c) if (0..4).contains(&c.as_int().unwrap_or(-1)) => {}
+                _ => return err("the gather component must be a constant from 0 to 3", span),
+            }
+            out.push(component);
+        }
+        let Some(texture) = args.next() else {
+            return err("expected a texture argument", span);
+        };
+        let Type::Texture { dim, arrayed, kind } = texture.ty.clone() else {
+            return err("expected a texture argument", span);
+        };
+        out.push(texture);
+        let mut rest: Vec<Expr> = args.collect();
+        let coords = dim.coordinates();
+        let float_coords = Type::Vector(coords, Scalar::F32);
+        let float_coords = if coords == 1 { F32 } else { float_coords };
+        let (multisampled, depth) = match &kind {
+            TextureKind::Sampled { multisampled, .. } => (*multisampled, false),
+            TextureKind::Depth { multisampled } => (*multisampled, true),
+            _ => (false, false),
+        };
+        let sampled_scalar = match &kind {
+            TextureKind::Sampled { sampled, .. } => *sampled,
+            TextureKind::Storage { format, .. } => texel_format_scalar(format).unwrap(),
+            _ => Scalar::F32,
+        };
+        let offsets = matches!(dim, TextureDim::D2 | TextureDim::D3);
+        let expect = |n: usize, rest: &Vec<Expr>| -> Result<()> {
+            if rest.len() == n {
+                Ok(())
+            } else {
+                err(format!("wrong number of arguments to {f:?}"), span)
+            }
+        };
+
+        let ret = match f {
+            TextureSample
+            | TextureSampleBias
+            | TextureSampleLevel
+            | TextureSampleGrad
+            | TextureSampleCompare
+            | TextureSampleCompareLevel
+            | TextureGather
+            | TextureGatherCompare => {
+                let compare = matches!(
+                    f,
+                    TextureSampleCompare | TextureSampleCompareLevel | TextureGatherCompare
+                );
+                if multisampled
+                    || !matches!(
+                        kind,
+                        TextureKind::Sampled { .. } | TextureKind::Depth { .. }
+                    )
+                {
+                    return err("this texture cannot be sampled", span);
+                }
+                if matches!(kind, TextureKind::Sampled { sampled, .. } if sampled != Scalar::F32)
+                    && f != TextureGather
+                {
+                    return err("only float textures can be sampled", span);
+                }
+                if compare && !depth {
+                    return err("comparison sampling needs a depth texture", span);
+                }
+                if matches!(f, TextureSampleBias | TextureSampleGrad) && depth {
+                    return err(
+                        "depth textures cannot be sampled with a bias or gradients",
+                        span,
+                    );
+                }
+                if matches!(f, TextureGather | TextureGatherCompare)
+                    && !matches!(dim, TextureDim::D2 | TextureDim::Cube)
+                {
+                    return err("only 2D and cube textures can be gathered", span);
+                }
+                if rest.is_empty() {
+                    return err("expected a sampler argument", span);
+                }
+                let sampler = rest.remove(0);
+                match sampler.ty {
+                    Type::Sampler { comparison } if comparison == compare => {}
+                    _ if compare => return err("expected a `sampler_comparison`", span),
+                    _ => return err("expected a `sampler`", span),
+                }
+                out.push(sampler);
+                // coords, array index, then the function's own operands, then an offset.
+                let own = match f {
+                    TextureSample | TextureGather => 0,
+                    TextureSampleGrad => 2,
+                    _ => 1,
+                };
+                let fixed = 1 + arrayed as usize + own;
+                let has_offset = rest.len() == fixed + 1;
+                if rest.len() != fixed && !has_offset {
+                    return err(format!("wrong number of arguments to {f:?}"), span);
+                }
+                if has_offset && !offsets {
+                    return err("offsets are only allowed on 2D and 3D textures", span);
+                }
+                let mut rest = rest.into_iter();
+                out.push(self.coerce(rest.next().unwrap(), &float_coords, span)?);
+                if arrayed {
+                    out.push(self.int_arg(rest.next().unwrap(), span)?);
+                }
+                match f {
+                    TextureSampleBias => out.push(self.coerce(rest.next().unwrap(), &F32, span)?),
+                    TextureSampleLevel if depth => {
+                        out.push(self.int_arg(rest.next().unwrap(), span)?)
+                    }
+                    TextureSampleLevel
+                    | TextureSampleCompare
+                    | TextureSampleCompareLevel
+                    | TextureGatherCompare => {
+                        out.push(self.coerce(rest.next().unwrap(), &F32, span)?)
+                    }
+                    TextureSampleGrad => {
+                        for _ in 0..2 {
+                            out.push(self.coerce(rest.next().unwrap(), &float_coords, span)?);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(offset) = rest.next() {
+                    let offset_ty = Type::Vector(coords, Scalar::I32);
+                    let offset = self.coerce(offset, &offset_ty, span)?;
+                    if offset.as_const().is_none() {
+                        return err("texture offsets must be constant expressions", span);
+                    }
+                    out.push(offset);
+                }
+                match f {
+                    TextureGather => Type::Vector(4, sampled_scalar),
+                    TextureGatherCompare => Type::Vector(4, Scalar::F32),
+                    _ if depth => F32,
+                    _ => Type::Vector(4, Scalar::F32),
+                }
+            }
+            TextureLoad => {
+                if dim == TextureDim::Cube {
+                    return err("cube textures cannot be loaded from", span);
+                }
+                let (needs_level, needs_sample) = match &kind {
+                    TextureKind::Sampled { .. } | TextureKind::Depth { .. } => {
+                        (!multisampled, multisampled)
+                    }
+                    TextureKind::Storage { access, .. } => {
+                        if *access == Access::Write {
+                            return err("cannot load from a write-only storage texture", span);
+                        }
+                        (false, false)
+                    }
+                    TextureKind::External => return unsupported_external(span),
+                };
+                expect(
+                    1 + arrayed as usize + (needs_level || needs_sample) as usize,
+                    &rest,
+                )?;
+                let mut rest = rest.into_iter();
+                out.push(self.int_coords(rest.next().unwrap(), coords, span)?);
+                for e in rest {
+                    out.push(self.int_arg(e, span)?);
+                }
+                if depth {
+                    F32
+                } else {
+                    Type::Vector(4, sampled_scalar)
+                }
+            }
+            TextureStore => {
+                let TextureKind::Storage { access, .. } = &kind else {
+                    return err("textureStore needs a storage texture", span);
+                };
+                if *access == Access::Read {
+                    return err("cannot store to a read-only storage texture", span);
+                }
+                expect(2 + arrayed as usize, &rest)?;
+                let mut rest = rest.into_iter();
+                out.push(self.int_coords(rest.next().unwrap(), coords, span)?);
+                if arrayed {
+                    out.push(self.int_arg(rest.next().unwrap(), span)?);
+                }
+                let value_ty = Type::Vector(4, sampled_scalar);
+                out.push(self.coerce(rest.next().unwrap(), &value_ty, span)?);
+                Type::Void
+            }
+            TextureDimensions => {
+                let has_levels = matches!(
+                    kind,
+                    TextureKind::Sampled { .. } | TextureKind::Depth { .. }
+                ) && !multisampled;
+                if rest.len() > has_levels as usize {
+                    return err(format!("wrong number of arguments to {f:?}"), span);
+                }
+                if let Some(level) = rest.pop() {
+                    out.push(self.int_arg(level, span)?);
+                }
+                match dim.extent() {
+                    1 => U32,
+                    n => Type::Vector(n, Scalar::U32),
+                }
+            }
+            TextureNumLayers | TextureNumLevels | TextureNumSamples => {
+                expect(0, &rest)?;
+                let ok = match f {
+                    TextureNumLayers => arrayed,
+                    TextureNumLevels => {
+                        matches!(
+                            kind,
+                            TextureKind::Sampled { .. } | TextureKind::Depth { .. }
+                        ) && !multisampled
+                    }
+                    _ => multisampled,
+                };
+                if !ok {
+                    return err(format!("{f:?} does not apply to this texture"), span);
+                }
+                U32
+            }
+            _ => unreachable!(),
+        };
+        Ok(Expr {
+            kind: ExprKind::Builtin(f, out),
+            ty: ret,
+            reference: None,
+        })
+    }
+
+    /// An array index, mip level, sample index or gather component: `i32` or `u32`.
+    fn int_arg(&self, e: Expr, span: Span) -> Result<Expr> {
+        let e = self.concretize(e, span)?;
+        match e.ty {
+            Type::Scalar(Scalar::I32 | Scalar::U32) => Ok(e),
+            _ => err("expected an `i32` or `u32`", span),
+        }
+    }
+
+    /// Integer texel coordinates: a scalar or vector of `i32` or `u32`.
+    fn int_coords(&self, e: Expr, n: u8, span: Span) -> Result<Expr> {
+        let e = self.concretize(e, span)?;
+        let ok = match &e.ty {
+            Type::Scalar(s) if n == 1 => s.is_integer(),
+            Type::Vector(m, s) => *m == n && s.is_integer(),
+            _ => false,
+        };
+        if ok {
+            Ok(e)
+        } else {
+            err(format!("expected {n} integer texel coordinates"), span)
         }
     }
 
@@ -2741,6 +3018,10 @@ fn matrix_alias(name: &str) -> Option<(u8, u8, Scalar)> {
     Some((c, r, scalar))
 }
 
+fn unsupported_external<T>(span: Span) -> Result<T> {
+    err("external textures are not supported", span)
+}
+
 fn sampled_texture(name: &str) -> Option<(TextureDim, bool, bool)> {
     Some(match name {
         "texture_1d" => (TextureDim::D1, false, false),
@@ -2938,6 +3219,53 @@ mod tests {
         );
         fails("fn f() { break; }", "outside a loop");
         fails("fn f() { f(); }", "recursion");
+    }
+
+    #[test]
+    fn texture_errors() {
+        let decls = "@group(0) @binding(0) var t: texture_2d<f32>;
+            @group(0) @binding(1) var s: sampler;
+            @group(0) @binding(2) var c: sampler_comparison;
+            @group(0) @binding(3) var d: texture_depth_2d;
+            @group(0) @binding(4) var r: texture_storage_2d<rgba8unorm, read>;
+            @group(0) @binding(5) var q: texture_cube<f32>;";
+        let case =
+            |body: &str, message: &str| fails(&format!("{decls} fn f() {{ {body} }}"), message);
+        case(
+            "let x = textureSample(t, c, vec2f());",
+            "expected a `sampler`",
+        );
+        case(
+            "let x = textureSampleCompare(t, c, vec2f(), 0.5);",
+            "needs a depth texture",
+        );
+        case(
+            "let x = textureSampleBias(d, s, vec2f(), 1.0);",
+            "bias or gradients",
+        );
+        case(
+            "let x = textureSample(t, s, vec2f(), vec2i(v));  let v = 1;",
+            "unresolved",
+        );
+        case(
+            "var o = vec2i(); let x = textureSample(t, s, vec2f(), o);",
+            "constant expressions",
+        );
+        case("textureStore(r, vec2i(), vec4f());", "read-only");
+        case(
+            "let x = textureLoad(t, vec2i());",
+            "wrong number of arguments",
+        );
+        case(
+            "let x = textureLoad(q, vec3i(), 0);",
+            "cube textures cannot be loaded",
+        );
+        case("let x = textureGather(4, t, s, vec2f());", "from 0 to 3");
+        case("let x = textureNumLayers(t);", "does not apply");
+        fails(
+            "@group(0) @binding(0) var w: texture_storage_2d<rgb9e5ufloat, write>;",
+            "unknown texel format",
+        );
     }
 
     #[test]

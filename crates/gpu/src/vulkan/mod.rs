@@ -1,15 +1,17 @@
 //! The Vulkan backend: instance, adapter and device.
 
+mod binding;
 mod command;
 mod conv;
 mod resource;
 mod surface;
 pub mod vk;
 
-pub use command::{CommandBuffer, CommandEncoder, Queue, RenderPassEncoder};
+pub use binding::{BindGroup, BindGroupLayout, PipelineLayout, Sampler};
+pub use command::{CommandBuffer, CommandEncoder, ComputePassEncoder, Queue, RenderPassEncoder};
 pub use resource::{
-    Buffer, BufferView, BufferViewMut, MapFuture, PipelineLayout, PipelineLayoutDescriptor,
-    RenderPipeline, ShaderModule, Texture, TextureView,
+    Buffer, BufferView, BufferViewMut, ComputePipeline, MapFuture, RenderPipeline, ShaderModule,
+    Texture, TextureView,
 };
 pub use surface::{Surface, SurfaceCapabilities, SurfaceTexture};
 
@@ -329,6 +331,12 @@ const FEATURE_DEPTH_CLAMP: usize = 11;
 const FEATURE_DEPTH_BIAS_CLAMP: usize = 12;
 const FEATURE_VERTEX_PIPELINE_STORES_AND_ATOMICS: usize = 25;
 const FEATURE_FRAGMENT_STORES_AND_ATOMICS: usize = 26;
+const FEATURE_ROBUST_BUFFER_ACCESS: usize = 0;
+pub(crate) const FEATURE_SAMPLER_ANISOTROPY: usize = 19;
+const FEATURE_SHADER_IMAGE_GATHER_EXTENDED: usize = 28;
+const FEATURE_SHADER_STORAGE_IMAGE_EXTENDED_FORMATS: usize = 29;
+const FEATURE_SHADER_STORAGE_IMAGE_READ_WITHOUT_FORMAT: usize = 31;
+const FEATURE_SHADER_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: usize = 32;
 
 impl AdapterShared {
     fn probe(instance: &Arc<InstanceShared>, raw: vk::PhysicalDevice) -> Option<Adapter> {
@@ -446,6 +454,10 @@ impl AdapterShared {
                 max_texture_dimension_3d: l.max_image_dimension_3d,
                 max_texture_array_layers: l.max_image_array_layers,
                 max_bind_groups: l.max_bound_descriptor_sets.min(8),
+                max_dynamic_uniform_buffers_per_pipeline_layout: l
+                    .max_descriptor_set_uniform_buffers_dynamic,
+                max_dynamic_storage_buffers_per_pipeline_layout: l
+                    .max_descriptor_set_storage_buffers_dynamic,
                 max_sampled_textures_per_shader_stage: l.max_per_stage_descriptor_sampled_images,
                 max_samplers_per_shader_stage: l.max_per_stage_descriptor_samplers,
                 max_storage_buffers_per_shader_stage: l.max_per_stage_descriptor_storage_buffers,
@@ -677,6 +689,12 @@ impl Device {
                 FEATURE_DEPTH_BIAS_CLAMP,
                 FEATURE_VERTEX_PIPELINE_STORES_AND_ATOMICS,
                 FEATURE_FRAGMENT_STORES_AND_ATOMICS,
+                FEATURE_ROBUST_BUFFER_ACCESS,
+                FEATURE_SAMPLER_ANISOTROPY,
+                FEATURE_SHADER_IMAGE_GATHER_EXTENDED,
+                FEATURE_SHADER_STORAGE_IMAGE_EXTENDED_FORMATS,
+                FEATURE_SHADER_STORAGE_IMAGE_READ_WITHOUT_FORMAT,
+                FEATURE_SHADER_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
             ] {
                 enabled.flags[index] = adapter.vk_features.flags[index];
             }
@@ -873,6 +891,12 @@ fn limits_fit(required: &Limits, supported: &Limits) -> bool {
 }
 
 impl DeviceShared {
+    /// Whether a `VkPhysicalDeviceFeatures` member, by index, is enabled. Every one the
+    /// device creation list names is enabled when the adapter has it.
+    pub fn has_feature_flag(&self, index: usize) -> bool {
+        self.adapter.vk_features.flags[index] != 0
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, DeviceState> {
         self.state.lock().unwrap()
     }

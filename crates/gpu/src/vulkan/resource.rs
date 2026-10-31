@@ -1,5 +1,9 @@
 //! Buffers, textures, shader modules and pipelines.
 
+use super::binding::{
+    auto_layout, empty_layout, BindGroupLayout, BindGroupLayoutShared, PipelineLayoutShared,
+    StageReflection,
+};
 use super::{check, conv, vk, Device, DeviceShared};
 use crate::*;
 use std::ffi::{c_void, CString};
@@ -9,11 +13,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-fn label(label: Option<&str>) -> String {
+pub(crate) fn label(label: Option<&str>) -> String {
     label.unwrap_or("").to_string()
 }
 
-fn named(kind: &str, label: &str) -> String {
+pub(crate) fn named(kind: &str, label: &str) -> String {
     if label.is_empty() {
         kind.to_string()
     } else {
@@ -1009,13 +1013,11 @@ pub(crate) struct TextureViewShared {
     pub texture: Arc<TextureShared>,
     pub raw: vk::ImageView,
     pub format: TextureFormat,
-    // Read by bind groups, which come next.
-    #[allow(dead_code)]
     pub dimension: TextureViewDimension,
-    #[allow(dead_code)]
     pub aspect: TextureAspect,
     pub base_mip_level: u32,
     pub mip_level_count: u32,
+    // For finer layout tracking, which is per texture for now.
     #[allow(dead_code)]
     pub base_array_layer: u32,
     pub array_layer_count: u32,
@@ -1183,89 +1185,12 @@ impl Device {
 }
 
 // ------------------------------------------------------------------------------------------
-// Pipeline layouts and render pipelines
-
-pub(crate) struct PipelineLayoutShared {
-    pub device: Arc<DeviceShared>,
-    pub raw: vk::PipelineLayout,
-}
-
-unsafe impl Send for PipelineLayoutShared {}
-unsafe impl Sync for PipelineLayoutShared {}
-
-impl Drop for PipelineLayoutShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_pipeline_layout)(
-                    self.device.raw,
-                    self.raw,
-                    std::ptr::null(),
-                )
-            };
-        }
-    }
-}
-
-impl PipelineLayoutShared {
-    fn empty(device: &Arc<DeviceShared>) -> Result<Arc<PipelineLayoutShared>, GpuError> {
-        let info = vk::PipelineLayoutCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            set_layout_count: 0,
-            p_set_layouts: std::ptr::null(),
-            push_constant_range_count: 0,
-            p_push_constant_ranges: std::ptr::null(),
-        };
-        let mut raw = 0;
-        unsafe {
-            check(
-                (device.fns.create_pipeline_layout)(device.raw, &info, std::ptr::null(), &mut raw),
-                "vkCreatePipelineLayout",
-            )?
-        };
-        Ok(Arc::new(PipelineLayoutShared {
-            device: device.clone(),
-            raw,
-        }))
-    }
-}
-
-/// `GPUPipelineLayoutDescriptor`. Bind group layouts arrive with bind groups.
-#[derive(Debug, Clone, Default)]
-pub struct PipelineLayoutDescriptor<'a> {
-    pub label: Option<&'a str>,
-}
-
-/// `GPUPipelineLayout`.
-#[derive(Clone)]
-pub struct PipelineLayout {
-    pub(crate) shared: Arc<PipelineLayoutShared>,
-}
-
-impl Device {
-    /// `createPipelineLayout`. Only layouts without bind groups exist so far.
-    pub fn create_pipeline_layout(&self, _desc: &PipelineLayoutDescriptor<'_>) -> PipelineLayout {
-        match PipelineLayoutShared::empty(&self.shared) {
-            Ok(shared) => PipelineLayout { shared },
-            Err(e) => {
-                self.shared.report(e);
-                PipelineLayout {
-                    shared: Arc::new(PipelineLayoutShared {
-                        device: self.shared.clone(),
-                        raw: 0,
-                    }),
-                }
-            }
-        }
-    }
-}
+// Render and compute pipelines
 
 pub(crate) struct RenderPipelineShared {
     pub device: Arc<DeviceShared>,
     pub raw: vk::Pipeline,
-    pub _layout: Option<Arc<PipelineLayoutShared>>,
+    pub layout: Option<Arc<PipelineLayoutShared>>,
     pub color_formats: Vec<Option<TextureFormat>>,
     pub depth_stencil_format: Option<TextureFormat>,
     pub sample_count: u32,
@@ -1301,7 +1226,7 @@ pub struct RenderPipeline {
 }
 
 /// Finds the entry point for a stage: the named one, or the module's only one.
-fn find_entry<'m>(
+pub(crate) fn find_entry<'m>(
     module: &'m shallot_wgsl::Module,
     name: Option<&str>,
     stage: shallot_wgsl::Stage,
@@ -1340,7 +1265,7 @@ impl Device {
                 shared: Arc::new(RenderPipelineShared {
                     device: device.clone(),
                     raw: 0,
-                    _layout: None,
+                    layout: None,
                     color_formats: Vec::new(),
                     depth_stencil_format: None,
                     sample_count: desc.multisample.count,
@@ -1393,19 +1318,19 @@ impl Device {
             None => None,
         };
 
-        let layout = match &desc.layout {
-            PipelineLayoutChoice::Layout(layout) => layout.shared.clone(),
-            PipelineLayoutChoice::Auto => {
-                let mut uses = vertex_reflection.bindings_for(vertex_entry).count();
-                if let Some((_, reflection, entry)) = &fragment {
-                    uses += reflection.bindings_for(entry).count();
-                }
-                if uses > 0 {
-                    return Err(v("shaders with resource bindings need bind groups, which are not implemented yet".into()));
-                }
-                PipelineLayoutShared::empty(device).map_err(PipelineError::Device)?
-            }
-        };
+        let mut reflections = vec![StageReflection {
+            module: vertex_reflection,
+            entry: vertex_entry,
+            stage: ShaderStages::VERTEX,
+        }];
+        if let Some((_, reflection, entry)) = &fragment {
+            reflections.push(StageReflection {
+                module: reflection,
+                entry,
+                stage: ShaderStages::FRAGMENT,
+            });
+        }
+        let layout = pipeline_layout(device, &desc.layout, &reflections)?;
 
         // Vertex inputs.
         let mut bindings = Vec::new();
@@ -1737,7 +1662,7 @@ impl Device {
             shared: Arc::new(RenderPipelineShared {
                 device: device.clone(),
                 raw,
-                _layout: Some(layout),
+                layout: Some(layout),
                 color_formats,
                 depth_stencil_format: ds_format,
                 sample_count: desc.multisample.count,
@@ -1749,7 +1674,202 @@ impl Device {
     }
 }
 
-enum PipelineError {
+pub(crate) enum PipelineError {
     Validation(String),
     Device(GpuError),
+}
+
+/// The layout a pipeline uses: the explicit one, checked against the shaders, or one derived
+/// from them.
+fn pipeline_layout(
+    device: &Arc<DeviceShared>,
+    choice: &PipelineLayoutChoice<'_>,
+    stages: &[StageReflection<'_>],
+) -> Result<Arc<PipelineLayoutShared>, PipelineError> {
+    let v = PipelineError::Validation;
+    match choice {
+        PipelineLayoutChoice::Layout(layout) => {
+            let layout = &layout.shared;
+            if layout.raw == 0 {
+                return Err(v("the pipeline layout is invalid".into()));
+            }
+            layout.check_stages(stages).map_err(v)?;
+            Ok(layout.clone())
+        }
+        PipelineLayoutChoice::Auto => auto_layout(device, stages).map_err(v),
+    }
+}
+
+/// `getBindGroupLayout`, shared by both pipeline kinds.
+fn bind_group_layout(
+    device: &Arc<DeviceShared>,
+    layout: Option<&Arc<PipelineLayoutShared>>,
+    what: String,
+    index: u32,
+) -> BindGroupLayout {
+    if let Some(group) = layout.and_then(|l| l.groups.get(index as usize)) {
+        return BindGroupLayout {
+            shared: group.clone(),
+        };
+    }
+    // An index the shaders leave unused, within the limit, is an empty layout in WebGPU.
+    if layout.is_some() && index < device.limits.max_bind_groups {
+        return BindGroupLayout {
+            shared: empty_layout(device),
+        };
+    }
+    device.validation(format!("{what}: no bind group layout at index {index}"));
+    BindGroupLayout {
+        shared: BindGroupLayoutShared::invalid(device, String::new()),
+    }
+}
+
+impl RenderPipeline {
+    /// `getBindGroupLayout`.
+    pub fn get_bind_group_layout(&self, index: u32) -> BindGroupLayout {
+        let p = &self.shared;
+        bind_group_layout(&p.device, p.layout.as_ref(), p.describe(), index)
+    }
+}
+
+pub(crate) struct ComputePipelineShared {
+    pub device: Arc<DeviceShared>,
+    pub raw: vk::Pipeline,
+    pub layout: Option<Arc<PipelineLayoutShared>>,
+    pub label: String,
+    pub valid: bool,
+}
+
+unsafe impl Send for ComputePipelineShared {}
+unsafe impl Sync for ComputePipelineShared {}
+
+impl Drop for ComputePipelineShared {
+    fn drop(&mut self) {
+        if self.raw != 0 {
+            unsafe {
+                (self.device.fns.destroy_pipeline)(self.device.raw, self.raw, std::ptr::null())
+            };
+        }
+    }
+}
+
+impl ComputePipelineShared {
+    pub fn describe(&self) -> String {
+        named("compute pipeline", &self.label)
+    }
+}
+
+/// `GPUComputePipeline`.
+#[derive(Clone)]
+pub struct ComputePipeline {
+    pub(crate) shared: Arc<ComputePipelineShared>,
+}
+
+impl ComputePipeline {
+    /// `getBindGroupLayout`.
+    pub fn get_bind_group_layout(&self, index: u32) -> BindGroupLayout {
+        let p = &self.shared;
+        bind_group_layout(&p.device, p.layout.as_ref(), p.describe(), index)
+    }
+}
+
+impl Device {
+    /// `createComputePipeline`.
+    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDescriptor<'_>) -> ComputePipeline {
+        let device = &self.shared;
+        let name = label(desc.label);
+        match self.compute_pipeline(desc) {
+            Ok((raw, layout)) => ComputePipeline {
+                shared: Arc::new(ComputePipelineShared {
+                    device: device.clone(),
+                    raw,
+                    layout: Some(layout),
+                    label: name,
+                    valid: true,
+                }),
+            },
+            Err(e) => {
+                match e {
+                    PipelineError::Validation(message) => device
+                        .validation(format!("{}: {message}", named("compute pipeline", &name))),
+                    PipelineError::Device(e) => device.report(e),
+                }
+                ComputePipeline {
+                    shared: Arc::new(ComputePipelineShared {
+                        device: device.clone(),
+                        raw: 0,
+                        layout: None,
+                        label: name,
+                        valid: false,
+                    }),
+                }
+            }
+        }
+    }
+
+    fn compute_pipeline(
+        &self,
+        desc: &ComputePipelineDescriptor<'_>,
+    ) -> Result<(vk::Pipeline, Arc<PipelineLayoutShared>), PipelineError> {
+        let device = &self.shared;
+        let v = PipelineError::Validation;
+        let module = &desc.compute.module.shared;
+        let Some(reflection) = module.module.as_ref() else {
+            return Err(v("the compute shader module is invalid".into()));
+        };
+        let entry = find_entry(
+            reflection,
+            desc.compute.entry_point,
+            shallot_wgsl::Stage::Compute,
+        )
+        .map_err(v)?;
+        let [x, y, z] = entry.workgroup_size;
+        let limits = &device.limits;
+        if x > limits.max_compute_workgroup_size_x
+            || y > limits.max_compute_workgroup_size_y
+            || z > limits.max_compute_workgroup_size_z
+            || x as u64 * y as u64 * z as u64 > limits.max_compute_invocations_per_workgroup as u64
+        {
+            return Err(v(format!(
+                "@workgroup_size({x}, {y}, {z}) exceeds the device's limits"
+            )));
+        }
+        let stages = [StageReflection {
+            module: reflection,
+            entry,
+            stage: ShaderStages::COMPUTE,
+        }];
+        let layout = pipeline_layout(device, &desc.layout, &stages)?;
+        let entry_name = CString::new(entry.name.as_str()).unwrap();
+        let info = vk::ComputePipelineCreateInfo {
+            s_type: vk::STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage: vk::PipelineShaderStageCreateInfo {
+                s_type: vk::STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::SHADER_STAGE_COMPUTE_BIT,
+                module: module.raw,
+                p_name: entry_name.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            layout: layout.raw,
+            base_pipeline_handle: 0,
+            base_pipeline_index: -1,
+        };
+        let mut raw = 0;
+        let r = unsafe {
+            (device.fns.create_compute_pipelines)(
+                device.raw,
+                0,
+                1,
+                &info,
+                std::ptr::null(),
+                &mut raw,
+            )
+        };
+        check(r, "vkCreateComputePipelines").map_err(PipelineError::Device)?;
+        Ok((raw, layout))
+    }
 }
