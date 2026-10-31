@@ -1,59 +1,40 @@
-//! Surfaces and swapchains: the `GPUCanvasContext` analogue.
+//! Vulkan surfaces and swapchains.
 
-use super::resource::TextureShared;
-use super::{check, conv, vk, Adapter, AdapterShared, Device, DeviceShared, InstanceShared};
+use super::resource::Texture;
+use super::{check, conv, vk, Adapter, Device, DeviceInner, InstanceInner};
+use crate::hal;
 use crate::*;
 use std::sync::{Arc, Mutex};
 
 /// Frames that may be queued for presentation at once (the browser's frame-latency limit).
-const FRAMES_IN_FLIGHT: usize = 2;
-
-struct Frame {
-    acquire: vk::Semaphore,
-    /// The present submission that last consumed `acquire`.
-    submission: u64,
-}
+pub(crate) const FRAMES_IN_FLIGHT: usize = 2;
 
 struct Swapchain {
-    device: Arc<DeviceShared>,
+    device: Arc<DeviceInner>,
     raw: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     config: SurfaceConfiguration,
     extent: vk::Extent2D,
     present_semaphores: Vec<vk::Semaphore>,
-    frames: Vec<Frame>,
-    next_frame: usize,
+    /// One acquire semaphore per frame in flight.
+    acquire: Vec<vk::Semaphore>,
     outdated: bool,
     generation: u64,
 }
 
-pub(crate) struct SurfaceShared {
-    instance: Arc<InstanceShared>,
+pub(crate) struct Surface {
+    instance: Arc<InstanceInner>,
     raw: vk::SurfaceKHR,
     swapchain: Mutex<Option<Swapchain>>,
     generations: Mutex<u64>,
 }
 
-unsafe impl Send for SurfaceShared {}
-unsafe impl Sync for SurfaceShared {}
-
-/// A window's presentable surface: `GPUCanvasContext`.
-pub struct Surface {
-    shared: Arc<SurfaceShared>,
-}
-
-/// What a surface supports on an adapter.
-#[derive(Debug, Clone, Default)]
-pub struct SurfaceCapabilities {
-    pub formats: Vec<TextureFormat>,
-    pub present_modes: Vec<PresentMode>,
-    pub alpha_modes: Vec<CompositeAlphaMode>,
-    pub usages: TextureUsage,
-}
+unsafe impl Send for Surface {}
+unsafe impl Sync for Surface {}
 
 impl Surface {
-    pub(crate) unsafe fn new(
-        instance: &Arc<InstanceShared>,
+    pub(super) unsafe fn new(
+        instance: &Arc<InstanceInner>,
         window: RawWindowHandle,
     ) -> Result<Surface, GpuError> {
         let mut raw = 0;
@@ -113,17 +94,17 @@ impl Surface {
             }
         }
         Ok(Surface {
-            shared: Arc::new(SurfaceShared {
-                instance: instance.clone(),
-                raw,
-                swapchain: Mutex::new(None),
-                generations: Mutex::new(0),
-            }),
+            instance: instance.clone(),
+            raw,
+            swapchain: Mutex::new(None),
+            generations: Mutex::new(0),
         })
     }
 
-    pub(crate) fn supported_by(&self, adapter: &AdapterShared) -> bool {
-        let Some(fns) = &self.shared.instance.surface else {
+    /// Whether `adapter` can present to this surface.
+    pub fn supported(&self, adapter: &Adapter) -> bool {
+        let adapter = &adapter.inner;
+        let Some(fns) = &self.instance.surface else {
             return false;
         };
         let mut supported = 0;
@@ -131,26 +112,21 @@ impl Surface {
             (fns.get_physical_device_surface_support)(
                 adapter.raw,
                 adapter.queue_family,
-                self.shared.raw,
+                self.raw,
                 &mut supported,
             )
         };
         r == vk::SUCCESS && supported != 0 && adapter.has_extension(c"VK_KHR_swapchain")
     }
 
-    fn surface_formats(&self, adapter: &AdapterShared) -> Vec<vk::SurfaceFormatKHR> {
-        let Some(fns) = &self.shared.instance.surface else {
+    fn surface_formats(&self, adapter: &super::AdapterInner) -> Vec<vk::SurfaceFormatKHR> {
+        let Some(fns) = &self.instance.surface else {
             return Vec::new();
         };
         unsafe {
             vk::enumerate(
                 |count, items| {
-                    (fns.get_physical_device_surface_formats)(
-                        adapter.raw,
-                        self.shared.raw,
-                        count,
-                        items,
-                    )
+                    (fns.get_physical_device_surface_formats)(adapter.raw, self.raw, count, items)
                 },
                 vk::SurfaceFormatKHR::default(),
             )
@@ -158,8 +134,8 @@ impl Surface {
         .unwrap_or_default()
     }
 
-    fn present_modes(&self, adapter: &AdapterShared) -> Vec<i32> {
-        let Some(fns) = &self.shared.instance.surface else {
+    fn present_modes(&self, adapter: &super::AdapterInner) -> Vec<i32> {
+        let Some(fns) = &self.instance.surface else {
             return Vec::new();
         };
         unsafe {
@@ -167,7 +143,7 @@ impl Surface {
                 |count, items| {
                     (fns.get_physical_device_surface_present_modes)(
                         adapter.raw,
-                        self.shared.raw,
+                        self.raw,
                         count,
                         items,
                     )
@@ -178,21 +154,24 @@ impl Surface {
         .unwrap_or_default()
     }
 
-    fn surface_capabilities(&self, adapter: &AdapterShared) -> Option<vk::SurfaceCapabilitiesKHR> {
-        let fns = self.shared.instance.surface.as_ref()?;
+    fn surface_capabilities(
+        &self,
+        adapter: &super::AdapterInner,
+    ) -> Option<vk::SurfaceCapabilitiesKHR> {
+        let fns = self.instance.surface.as_ref()?;
         let mut caps = vk::SurfaceCapabilitiesKHR::default();
         let r = unsafe {
-            (fns.get_physical_device_surface_capabilities)(adapter.raw, self.shared.raw, &mut caps)
+            (fns.get_physical_device_surface_capabilities)(adapter.raw, self.raw, &mut caps)
         };
         (r == vk::SUCCESS).then_some(caps)
     }
 
     /// The formats, present modes and alpha modes this surface supports with `adapter`.
     pub fn capabilities(&self, adapter: &Adapter) -> SurfaceCapabilities {
-        let adapter = &adapter.shared;
-        if !self.supported_by(adapter) {
+        if !self.supported(adapter) {
             return SurfaceCapabilities::default();
         }
+        let adapter = &adapter.inner;
         let mut formats: Vec<TextureFormat> = self
             .surface_formats(adapter)
             .iter()
@@ -239,36 +218,37 @@ impl Surface {
         }
     }
 
-    /// `configure`. Call again after the window resizes.
-    pub fn configure(&self, device: &Device, config: &SurfaceConfiguration) {
-        let mut slot = self.shared.swapchain.lock().unwrap();
+    /// (Re)creates the swapchain. Errors in the configuration are validation errors.
+    pub fn configure(
+        &self,
+        device: &Device,
+        config: &SurfaceConfiguration,
+    ) -> Result<(), GpuError> {
+        let mut slot = self.swapchain.lock().unwrap();
         let old = slot.take();
         if let Some(old) = &old {
             unsafe { (old.device.fns.device_wait_idle)(old.device.raw) };
         }
-        match self.create_swapchain(&device.shared, config, old) {
-            Ok(swapchain) => *slot = Some(swapchain),
-            Err(e) => device.shared.report(e),
-        }
+        *slot = Some(self.create_swapchain(&device.inner, config, old)?);
+        Ok(())
     }
 
-    /// `unconfigure`.
     pub fn unconfigure(&self) {
-        if let Some(old) = self.shared.swapchain.lock().unwrap().take() {
-            destroy_swapchain(old, true);
+        if let Some(old) = self.swapchain.lock().unwrap().take() {
+            destroy_swapchain(old);
         }
     }
 
     fn create_swapchain(
         &self,
-        device: &Arc<DeviceShared>,
+        device: &Arc<DeviceInner>,
         config: &SurfaceConfiguration,
         old: Option<Swapchain>,
     ) -> Result<Swapchain, GpuError> {
         let adapter = &device.adapter;
         let fail = |message: String, old: Option<Swapchain>| {
             if let Some(old) = old {
-                destroy_swapchain(old, true);
+                destroy_swapchain(old);
             }
             Err(GpuError::Validation(format!("configure: {message}")))
         };
@@ -278,7 +258,20 @@ impl Surface {
                 old,
             );
         };
-        if !self.supported_by(adapter) {
+        let supported = {
+            let fns = self.instance.surface.as_ref();
+            let mut supported = 0;
+            fns.is_some_and(|fns| unsafe {
+                (fns.get_physical_device_surface_support)(
+                    adapter.raw,
+                    adapter.queue_family,
+                    self.raw,
+                    &mut supported,
+                ) == vk::SUCCESS
+                    && supported != 0
+            })
+        };
+        if !supported {
             return fail("the adapter cannot present to this surface".into(), old);
         }
         let caps = self.surface_capabilities(adapter).unwrap_or_default();
@@ -349,7 +342,7 @@ impl Surface {
             s_type: vk::STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             p_next: std::ptr::null(),
             flags: 0,
-            surface: self.shared.raw,
+            surface: self.raw,
             min_image_count: image_count,
             image_format: surface_format.format,
             image_color_space: surface_format.color_space,
@@ -375,9 +368,9 @@ impl Surface {
         let r = unsafe {
             (swapchain_fns.create_swapchain)(device.raw, &info, std::ptr::null(), &mut raw)
         };
-        let (frames, present_semaphores) = match old {
+        let (acquire, present_semaphores) = match old {
             Some(old) => {
-                let kept = (old.frames, old.present_semaphores);
+                let kept = (old.acquire, old.present_semaphores);
                 unsafe {
                     (swapchain_fns.destroy_swapchain)(old.device.raw, old.raw, std::ptr::null())
                 };
@@ -385,16 +378,14 @@ impl Surface {
             }
             None => (Vec::new(), Vec::new()),
         };
-        let cleanup = |frames: Vec<Frame>, semaphores: Vec<vk::Semaphore>| unsafe {
-            for f in frames {
-                (device.fns.destroy_semaphore)(device.raw, f.acquire, std::ptr::null());
-            }
+        let cleanup = |semaphores: Vec<vk::Semaphore>| unsafe {
             for s in semaphores {
                 (device.fns.destroy_semaphore)(device.raw, s, std::ptr::null());
             }
         };
         if let Err(e) = check(r, "vkCreateSwapchainKHR") {
-            cleanup(frames, present_semaphores);
+            cleanup(acquire);
+            cleanup(present_semaphores);
             return Err(e);
         }
         let images = unsafe {
@@ -407,7 +398,8 @@ impl Surface {
             Ok(images) => images,
             Err(r) => {
                 unsafe { (swapchain_fns.destroy_swapchain)(device.raw, raw, std::ptr::null()) };
-                cleanup(frames, present_semaphores);
+                cleanup(acquire);
+                cleanup(present_semaphores);
                 return Err(check(r, "vkGetSwapchainImagesKHR").unwrap_err());
             }
         };
@@ -426,19 +418,16 @@ impl Surface {
             };
             Ok(s)
         };
-        let mut frames = frames;
-        while frames.len() < FRAMES_IN_FLIGHT {
-            frames.push(Frame {
-                acquire: new_semaphore()?,
-                submission: 0,
-            });
+        let mut acquire = acquire;
+        while acquire.len() < FRAMES_IN_FLIGHT {
+            acquire.push(new_semaphore()?);
         }
         let mut present_semaphores = present_semaphores;
         while present_semaphores.len() < images.len() {
             present_semaphores.push(new_semaphore()?);
         }
         let generation = {
-            let mut g = self.shared.generations.lock().unwrap();
+            let mut g = self.generations.lock().unwrap();
             *g += 1;
             *g
         };
@@ -449,20 +438,21 @@ impl Surface {
             config: config.clone(),
             extent,
             present_semaphores,
-            frames,
-            next_frame: 0,
+            acquire,
             outdated: false,
             generation,
         })
     }
 
-    /// `getCurrentTexture`. Present the result with [`SurfaceTexture::present`] (dropping it
-    /// presents too, as a canvas does at the end of the frame).
-    pub fn get_current_texture(&self) -> Result<SurfaceTexture, SurfaceError> {
-        let mut slot = self.shared.swapchain.lock().unwrap();
+    /// Acquires the next image, using frame slot `frame`'s semaphore. The caller has waited
+    /// for the submission that last used that slot. An outdated swapchain is recreated once.
+    pub fn acquire(&self, frame: usize) -> Result<hal::Acquired, hal::AcquireError> {
+        let mut slot = self.swapchain.lock().unwrap();
         for attempt in 0..2 {
             let Some(swapchain) = slot.as_mut() else {
-                return Err(SurfaceError::NotConfigured);
+                return Err(hal::AcquireError::Other(
+                    "the surface is not configured".into(),
+                ));
             };
             if swapchain.outdated {
                 let config = swapchain.config.clone();
@@ -473,150 +463,87 @@ impl Surface {
                 }
                 match self.create_swapchain(&device, &config, old) {
                     Ok(new) => *slot = Some(new),
-                    Err(_) => return Err(SurfaceError::Outdated),
+                    Err(_) => return Err(hal::AcquireError::Outdated),
                 }
                 continue;
             }
-            let device = swapchain.device.clone();
-            let frame = swapchain.next_frame % FRAMES_IN_FLIGHT;
-            {
-                let mut state = device.lock();
-                device.wait_for(&mut state, swapchain.frames[frame].submission);
-            }
+            let device = &swapchain.device;
             let fns = device.swapchain.as_ref().unwrap();
+            let semaphore = swapchain.acquire[frame % FRAMES_IN_FLIGHT];
             let mut index = 0;
             let r = unsafe {
                 (fns.acquire_next_image)(
                     device.raw,
                     swapchain.raw,
                     1_000_000_000,
-                    swapchain.frames[frame].acquire,
+                    semaphore,
                     0,
                     &mut index,
                 )
             };
             match r {
                 vk::SUCCESS | vk::SUBOPTIMAL_KHR => {
-                    swapchain.next_frame += 1;
-                    let config = &swapchain.config;
-                    let texture = TextureShared::swapchain_image(
-                        &device,
+                    let texture = Texture::swapchain_image(
+                        device,
                         swapchain.images[index as usize],
-                        config.format,
-                        config.usage,
-                        swapchain.extent.width,
-                        swapchain.extent.height,
-                        swapchain.frames[frame].acquire,
+                        swapchain.config.format,
+                        semaphore,
                     );
-                    return Ok(SurfaceTexture {
-                        texture: Texture {
-                            shared: Arc::new(texture),
-                        },
+                    return Ok(hal::Acquired {
+                        texture,
+                        image: index,
                         suboptimal: r == vk::SUBOPTIMAL_KHR,
-                        surface: self.shared.clone(),
-                        image_index: index,
-                        frame,
                         generation: swapchain.generation,
-                        presented: false,
                     });
                 }
                 vk::ERROR_OUT_OF_DATE_KHR if attempt == 0 => swapchain.outdated = true,
-                vk::ERROR_OUT_OF_DATE_KHR => return Err(SurfaceError::Outdated),
-                vk::TIMEOUT | vk::NOT_READY => return Err(SurfaceError::Timeout),
-                vk::ERROR_SURFACE_LOST_KHR => return Err(SurfaceError::Lost),
+                vk::ERROR_OUT_OF_DATE_KHR => return Err(hal::AcquireError::Outdated),
+                vk::TIMEOUT | vk::NOT_READY => return Err(hal::AcquireError::Timeout),
+                vk::ERROR_SURFACE_LOST_KHR => return Err(hal::AcquireError::Lost),
                 other => {
-                    return Err(SurfaceError::Other(format!(
+                    return Err(hal::AcquireError::Other(format!(
                         "vkAcquireNextImageKHR: {}",
                         vk::result_name(other)
                     )))
                 }
             }
         }
-        Err(SurfaceError::Outdated)
-    }
-}
-
-impl Drop for SurfaceShared {
-    fn drop(&mut self) {
-        if let Some(swapchain) = self.swapchain.get_mut().unwrap().take() {
-            destroy_swapchain(swapchain, true);
-        }
-        if let Some(fns) = &self.instance.surface {
-            unsafe { (fns.destroy_surface)(self.instance.raw, self.raw, std::ptr::null()) };
-        }
-    }
-}
-
-fn destroy_swapchain(swapchain: Swapchain, wait: bool) {
-    let device = &swapchain.device;
-    unsafe {
-        if wait {
-            (device.fns.device_wait_idle)(device.raw);
-        }
-        let mut state = device.lock();
-        device.retire(&mut state);
-        drop(state);
-        for frame in &swapchain.frames {
-            (device.fns.destroy_semaphore)(device.raw, frame.acquire, std::ptr::null());
-        }
-        for &s in &swapchain.present_semaphores {
-            (device.fns.destroy_semaphore)(device.raw, s, std::ptr::null());
-        }
-        if let Some(fns) = &device.swapchain {
-            (fns.destroy_swapchain)(device.raw, swapchain.raw, std::ptr::null());
-        }
-    }
-}
-
-/// A texture to draw into this frame, from [`Surface::get_current_texture`].
-pub struct SurfaceTexture {
-    pub texture: Texture,
-    /// The swapchain no longer matches the window exactly; reconfigure when convenient.
-    pub suboptimal: bool,
-    surface: Arc<SurfaceShared>,
-    image_index: u32,
-    frame: usize,
-    generation: u64,
-    presented: bool,
-}
-
-impl SurfaceTexture {
-    /// Queues the texture for display.
-    pub fn present(mut self) {
-        self.present_now();
+        Err(hal::AcquireError::Outdated)
     }
 
-    fn present_now(&mut self) {
-        if std::mem::replace(&mut self.presented, true) {
-            return;
-        }
-        let mut slot = self.surface.swapchain.lock().unwrap();
+    /// The size of the current swapchain's images.
+    pub fn extent(&self) -> (u32, u32) {
+        self.swapchain
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or((0, 0), |s| (s.extent.width, s.extent.height))
+    }
+
+    /// The generation of the current swapchain, or 0 when there is none.
+    pub fn generation(&self) -> u64 {
+        self.swapchain
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |s| s.generation)
+    }
+
+    /// The semaphore a submission presenting `image` signals.
+    pub(super) fn present_semaphore(&self, image: u32) -> vk::Semaphore {
+        let slot = self.swapchain.lock().unwrap();
+        slot.as_ref().unwrap().present_semaphores[image as usize]
+    }
+
+    /// Queues `image` for display, after the submission that signalled its semaphore.
+    pub fn present(&self, image: u32) {
+        let mut slot = self.swapchain.lock().unwrap();
         let Some(swapchain) = slot.as_mut() else {
             return;
         };
-        if swapchain.generation != self.generation {
-            return;
-        }
-        let device = swapchain.device.clone();
-        let semaphore = swapchain.present_semaphores[self.image_index as usize];
-        let submitted = {
-            let mut state = device.lock();
-            device.submit_locked(
-                &mut state,
-                Vec::new(),
-                Some((&self.texture.shared, semaphore)),
-            )
-        };
-        let index = match submitted {
-            Ok(index) => index,
-            Err(e) => {
-                drop(slot);
-                device.report(e);
-                return;
-            }
-        };
-        swapchain.frames[self.frame].submission = index;
+        let device = &swapchain.device;
         let fns = device.swapchain.as_ref().unwrap();
+        let semaphore = swapchain.present_semaphores[image as usize];
         let info = vk::PresentInfoKHR {
             s_type: vk::STRUCTURE_TYPE_PRESENT_INFO_KHR,
             p_next: std::ptr::null(),
@@ -624,18 +551,43 @@ impl SurfaceTexture {
             p_wait_semaphores: &semaphore,
             swapchain_count: 1,
             p_swapchains: &swapchain.raw,
-            p_image_indices: &self.image_index,
+            p_image_indices: &image,
             p_results: std::ptr::null_mut(),
         };
-        let r = unsafe { (fns.queue_present)(device.queue, &info) };
+        let r = {
+            let _queue = device.command_pool.lock().unwrap();
+            unsafe { (fns.queue_present)(device.queue, &info) }
+        };
         if r == vk::ERROR_OUT_OF_DATE_KHR || r == vk::SUBOPTIMAL_KHR {
             swapchain.outdated = true;
         }
     }
 }
 
-impl Drop for SurfaceTexture {
+impl Drop for Surface {
     fn drop(&mut self) {
-        self.present_now();
+        if let Some(swapchain) = self.swapchain.get_mut().unwrap().take() {
+            destroy_swapchain(swapchain);
+        }
+        if let Some(fns) = &self.instance.surface {
+            unsafe { (fns.destroy_surface)(self.instance.raw, self.raw, std::ptr::null()) };
+        }
+    }
+}
+
+fn destroy_swapchain(swapchain: Swapchain) {
+    let device = &swapchain.device;
+    unsafe {
+        (device.fns.device_wait_idle)(device.raw);
+        for &s in swapchain
+            .acquire
+            .iter()
+            .chain(&swapchain.present_semaphores)
+        {
+            (device.fns.destroy_semaphore)(device.raw, s, std::ptr::null());
+        }
+        if let Some(fns) = &device.swapchain {
+            (fns.destroy_swapchain)(device.raw, swapchain.raw, std::ptr::null());
+        }
     }
 }

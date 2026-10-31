@@ -1,9 +1,14 @@
-//! A WebGPU implementation in Rust, over Vulkan.
+//! A WebGPU implementation in Rust.
 //!
 //! The types mirror the WebGPU IDL one for one with the `GPU` prefixes dropped and methods in
 //! snake case: [`Instance`] is `navigator.gpu`, [`Surface`] is `GPUCanvasContext`, and so on.
 //! WGSL shaders are compiled with `shallot-wgsl`. Nothing beyond `std` is used: the Vulkan
 //! loader is opened at run time.
+//!
+//! The crate is split in two. `frontend` implements the WebGPU API itself: validation, error
+//! scopes, mapping, submission tracking and frame pacing. `hal` is the backend underneath it,
+//! which only creates native objects from validated descriptions and records validated
+//! commands. Vulkan is the only backend for now.
 //!
 //! Implemented so far (see `docs/porting/gpu.md`): instance, adapter, device, queue, buffers,
 //! textures and views, samplers, bind groups and their layouts (explicit and `"auto"`), shader
@@ -29,16 +34,17 @@
 
 mod error;
 mod executor;
+mod frontend;
+mod hal;
 mod types;
-mod vulkan;
 
 pub use error::{ErrorFilter, GpuError, MapError, RequestDeviceError, SurfaceError};
 pub use executor::block_on;
-pub use shallot_platform::RawWindowHandle;
-pub use types::*;
-pub use vulkan::{
+pub use frontend::{
     Adapter, BindGroup, BindGroupLayout, Buffer, BufferView, BufferViewMut, CommandBuffer,
     CommandEncoder, ComputePassEncoder, ComputePipeline, Device, Instance, MapFuture,
     PipelineLayout, PollType, Queue, RenderPassEncoder, RenderPipeline, Sampler, ShaderModule,
     Surface, SurfaceCapabilities, SurfaceTexture, Texture, TextureView,
 };
+pub use shallot_platform::RawWindowHandle;
+pub use types::*;
