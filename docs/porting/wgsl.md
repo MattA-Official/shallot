@@ -51,10 +51,13 @@ source text ─▶ lexer ─▶ parser ─▶ AST ─▶ resolver ─▶ type ch
 
 ### MSL
 
-- Targets MSL 2.3 (macOS 11+). Resources passed as entry-point arguments with explicit `[[buffer(n)]]`, `[[texture(n)]]`, `[[sampler(n)]]` indices derived from a per-pipeline binding map that `shallot-gpu` shares.
-- Runtime-sized arrays get their lengths from an implicit sizes buffer, the approach every WebGPU-on-Metal implementation uses.
-- Same undefined-behaviour emulation as SPIR-V.
-- Output checked by compiling with `xcrun metal` on macOS CI.
+- Targets MSL 2.3 (macOS 11+). `Module::to_msl` writes the whole module; each entry point becomes an `ep_<name>` function.
+- Resources are entry-point arguments with explicit `[[buffer(n)]]`, `[[texture(n)]]` and `[[sampler(n)]]` indices. Each kind is numbered from 0 in `(group, binding)` order, and `MslEntryPoint::resources` reports the map for `shallot-gpu`. Vertex buffers go from `vertex_buffer_base` up.
+- Metal has no module-scope variables, so the globals a function uses, through its calls included, become reference parameters. Private and workgroup globals are declared in the entry point; workgroup memory is zeroed by invocation 0 before a barrier, as WGSL requires.
+- Host-shareable structs follow WGSL's offsets: `vec3` members are `packed_float3` and gaps are explicit padding. Fixed-size arrays are wrapped in structs, so they are values.
+- Runtime-sized arrays get their lengths from an implicit sizes buffer, the approach every WebGPU-on-Metal implementation uses. `MslOutput::buffer_sizes` lists the bindings it holds.
+- Same undefined-behaviour emulation as SPIR-V, plus clamped array indices, which Vulkan gets from robust buffer access.
+- Output checked by compiling with `xcrun metal` on macOS CI (`SHALLOT_REQUIRE_METAL` makes a missing compiler a failure).
 
 ### WGSL
 

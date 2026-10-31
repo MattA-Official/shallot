@@ -46,11 +46,15 @@ jobs:
           exit $status
       - name: format
         run: for crate in $PORT_CRATES; do cargo fmt -p "$crate" --check; done
+      - name: find the Metal shader compiler
+        # Newer Xcodes ship the Metal toolchain as a separate component.
+        run: xcrun -sdk macosx -f metal || xcodebuild -downloadComponent MetalToolchain
       - name: clippy
         run: cargo clippy $(printf -- '-p %s ' $PORT_CRATES) --all-targets -- -D warnings
-      - name: tests (under the Vulkan validation layers)
+      - name: tests (under the Vulkan validation layers, with the MSL output compiled)
         env:
           SHALLOT_GPU_VALIDATION: "1"
+          SHALLOT_REQUIRE_METAL: "1"
         run: cargo test $(printf -- '-p %s ' $PORT_CRATES)
       - name: triangle example, headless and windowed
         env:
