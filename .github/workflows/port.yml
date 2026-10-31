@@ -107,3 +107,34 @@ jobs:
         run: |
           xvfb-run -a cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --headless triangle.png
           xvfb-run -a cargo run --target x86_64-pc-windows-gnu -p shallot-gpu --example triangle -- --frames 120
+
+  macos:
+    # The Cocoa window and Vulkan through MoltenVK, which presents to the window's CAMetalLayer
+    # with VK_EXT_metal_surface.
+    timeout-minutes: 20
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          rustflags: ""
+      - name: install the Vulkan loader and MoltenVK
+        run: |
+          brew install vulkan-loader molten-vk
+          prefix=$(brew --prefix)
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+          icd=$(find "$(brew --prefix molten-vk)/" -name 'MoltenVK_icd.json' | head -n 1)
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+      - name: clippy
+        run: cargo clippy $(printf -- '-p %s ' $PORT_CRATES) --all-targets -- -D warnings
+      - name: tests
+        run: cargo test $(printf -- '-p %s ' $PORT_CRATES)
+      - name: triangle example, headless and windowed
+        run: |
+          cargo run -p shallot-gpu --example triangle -- --headless triangle.png
+          cargo run -p shallot-gpu --example triangle -- --frames 120
+      - uses: actions/upload-artifact@v7
+        with:
+          name: triangle-macos
+          path: triangle.png

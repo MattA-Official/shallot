@@ -9,7 +9,7 @@
 //! | Linux   | X11 (`libX11.so.6`, loaded)     | implemented |
 //! | Linux   | Wayland                         | planned     |
 //! | Windows | Win32 (`user32.dll`, loaded)    | implemented |
-//! | macOS   | Cocoa through the objc runtime  | planned     |
+//! | macOS   | Cocoa through the objc runtime  | implemented |
 //!
 //! ```no_run
 //! use shallot_platform::{Event, Window, WindowConfig};
@@ -31,6 +31,8 @@ pub mod library;
 pub mod time;
 mod window;
 
+#[cfg(target_os = "macos")]
+mod cocoa;
 #[cfg(windows)]
 mod win32;
 #[cfg(target_os = "linux")]

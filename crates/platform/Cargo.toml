@@ -6,3 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+# Opens a real window, which AppKit allows only on the main thread: libtest's runner would put
+# the test on a worker thread, so this test has its own `main`.
+[[test]]
+name = "window"
+harness = false
