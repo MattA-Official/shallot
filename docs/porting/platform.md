@@ -54,6 +54,8 @@ pub fn run(config: WindowConfig, handler: impl Handler) -> Result<(), PlatformEr
 - Audio: WASAPI shared mode in event-driven mode through COM vtables declared by hand (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioRenderClient`).
 - Surface: `HWND` + `HINSTANCE` for `VK_KHR_win32_surface`.
 
+Status: window, keyboard (scan codes, text with surrogate pairs), mouse buttons with capture, wheel, enter/leave, focus, resize, DPI awareness and the Vulkan surface are in `crates/platform/src/win32.rs`, with `user32.dll` loaded at run time. Mouse input still comes from the classic `WM_*BUTTON*` messages; `WM_POINTER*`, Raw Input, timing, audio and the device-pixel-ratio event follow with step 6 below. CI checks it twice: natively on `windows-latest` (lints and tests, including a real window fed posted messages) and as a cross-compiled build under Wine on Linux, where `winevulkan` forwards to lavapipe so the GPU tests and the windowed triangle run against the Win32 surface.
+
 ### macOS
 
 - Cocoa through the Objective-C runtime only: `objc_getClass`, `sel_registerName`, `objc_msgSend` with typed casts, and `objc_allocateClassPair` to define the `NSApplicationDelegate`, `NSWindowDelegate` and `NSView` subclasses at run time. No Objective-C source.

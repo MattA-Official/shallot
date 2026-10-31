@@ -44,6 +44,7 @@ pub(crate) struct InstanceShared {
     pub fns: vk::InstanceFns,
     pub surface: Option<vk::SurfaceFns>,
     pub xlib_surface: Option<vk::XlibSurfaceFns>,
+    pub win32_surface: Option<vk::Win32SurfaceFns>,
     pub api_version: u32,
 }
 
@@ -120,7 +121,11 @@ impl Instance {
             let has = |name: &CStr| available.iter().any(|e| e.name() == name);
 
             let mut extensions: Vec<&CStr> = Vec::new();
-            let wanted: &[&CStr] = &[c"VK_KHR_surface", c"VK_KHR_xlib_surface"];
+            let wanted: &[&CStr] = &[
+                c"VK_KHR_surface",
+                c"VK_KHR_xlib_surface",
+                c"VK_KHR_win32_surface",
+            ];
             for &name in wanted {
                 if has(name) {
                     extensions.push(name);
@@ -187,6 +192,11 @@ impl Instance {
             } else {
                 None
             };
+            let win32_surface = if extensions.contains(&c"VK_KHR_win32_surface") {
+                vk::Win32SurfaceFns::load(load).ok()
+            } else {
+                None
+            };
             Ok(Instance {
                 shared: Arc::new(InstanceShared {
                     _library: library,
@@ -194,6 +204,7 @@ impl Instance {
                     fns,
                     surface,
                     xlib_surface,
+                    win32_surface,
                     api_version,
                 }),
             })

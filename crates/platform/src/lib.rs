@@ -8,7 +8,7 @@
 //! |---------|---------------------------------|-------------|
 //! | Linux   | X11 (`libX11.so.6`, loaded)     | implemented |
 //! | Linux   | Wayland                         | planned     |
-//! | Windows | Win32                           | planned     |
+//! | Windows | Win32 (`user32.dll`, loaded)    | implemented |
 //! | macOS   | Cocoa through the objc runtime  | planned     |
 //!
 //! ```no_run
@@ -31,6 +31,8 @@ pub mod library;
 pub mod time;
 mod window;
 
+#[cfg(windows)]
+mod win32;
 #[cfg(target_os = "linux")]
 mod x11;
 

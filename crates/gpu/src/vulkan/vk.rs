@@ -1,6 +1,6 @@
 //! Hand-written Vulkan declarations for the subset `shallot-gpu` calls.
 //!
-//! Transcribed from `vulkan_core.h` 1.3.275, `vulkan_xlib.h` and the Vulkan specification.
+//! Transcribed from `vulkan_core.h` 1.3.275, `vulkan_xlib.h`, `vulkan_win32.h` and the Vulkan specification.
 //! Struct sizes are asserted in the tests against the sizes the C headers give on 64-bit
 //! targets. Grows with use.
 
@@ -120,6 +120,7 @@ pub const STRUCTURE_TYPE_DEPENDENCY_INFO: i32 = 1000314003;
 pub const STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR: i32 = 1000001000;
 pub const STRUCTURE_TYPE_PRESENT_INFO_KHR: i32 = 1000001001;
 pub const STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR: i32 = 1000004000;
+pub const STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR: i32 = 1000009000;
 
 // Queue, memory and usage flags.
 pub const QUEUE_GRAPHICS_BIT: Flags = 0x1;
@@ -1129,6 +1130,15 @@ pub struct XlibSurfaceCreateInfoKHR {
 }
 
 #[repr(C)]
+pub struct Win32SurfaceCreateInfoKHR {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: Flags,
+    pub hinstance: *mut c_void,
+    pub hwnd: *mut c_void,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SurfaceCapabilitiesKHR {
     pub min_image_count: u32,
@@ -1370,6 +1380,11 @@ fn_table!(XlibSurfaceFns {
         fn(Instance, *const XlibSurfaceCreateInfoKHR, *const c_void, *mut SurfaceKHR) -> Result;
 });
 
+fn_table!(Win32SurfaceFns {
+    create_win32_surface = "vkCreateWin32SurfaceKHR":
+        fn(Instance, *const Win32SurfaceCreateInfoKHR, *const c_void, *mut SurfaceKHR) -> Result;
+});
+
 fn_table!(DeviceFns {
     destroy_device = "vkDestroyDevice": fn(Device, *const c_void);
     get_device_queue = "vkGetDeviceQueue": fn(Device, u32, u32, *mut Queue);
@@ -1563,7 +1578,10 @@ mod tests {
         assert_eq!(size_of::<DependencyInfo>(), 64);
         assert_eq!(size_of::<BufferImageCopy>(), 56);
         assert_eq!(size_of::<SubmitInfo>(), 72);
+        // `Window` is an `unsigned long`, which is 64 bits on the Unix targets Xlib runs on.
+        #[cfg(unix)]
         assert_eq!(size_of::<XlibSurfaceCreateInfoKHR>(), 40);
+        assert_eq!(size_of::<Win32SurfaceCreateInfoKHR>(), 40);
         assert_eq!(size_of::<SurfaceCapabilitiesKHR>(), 52);
         assert_eq!(size_of::<SwapchainCreateInfoKHR>(), 104);
         assert_eq!(size_of::<PresentInfoKHR>(), 64);
