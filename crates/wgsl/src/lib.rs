@@ -1,11 +1,11 @@
-//! A WGSL compiler: lexer, parser, type checker and SPIR-V back end.
+//! A WGSL compiler: lexer, parser, type checker, and SPIR-V and MSL back ends.
 //!
 //! [`compile`] takes WGSL source to a checked [`Module`], which reflects entry points and
 //! resource bindings (what WebGPU's `layout: "auto"` needs) and lowers to SPIR-V for Vulkan with
-//! [`Module::to_spirv`].
+//! [`Module::to_spirv`] and to MSL for Metal with [`Module::to_msl`].
 //!
 //! The front end follows the WGSL specification's grammar and typing rules, including abstract
-//! numeric literals and constant evaluation. The back end does not yet cover every builtin;
+//! numeric literals and constant evaluation. The back ends do not yet cover every builtin;
 //! unsupported ones are reported as compile errors rather than miscompiled.
 
 pub mod ast;
@@ -13,12 +13,14 @@ mod check;
 mod consts;
 pub mod ir;
 pub mod lexer;
+mod msl;
 pub mod parser;
 mod spirv;
 pub mod types;
 
 pub use check::check;
 pub use ir::{Binding, EntryPoint, Module, ResourceKind, Stage};
+pub use msl::{MslEntryPoint, MslOptions, MslOutput, MslResource, MslSlot};
 pub use parser::parse;
 pub use spirv::SpirvOptions;
 
