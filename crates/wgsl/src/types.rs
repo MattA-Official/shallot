@@ -112,6 +112,40 @@ pub enum TextureDim {
     Cube,
 }
 
+impl TextureDim {
+    /// Components of a texel coordinate: cube textures are addressed by a direction.
+    pub fn coordinates(self) -> u8 {
+        match self {
+            TextureDim::D1 => 1,
+            TextureDim::D2 => 2,
+            TextureDim::D3 | TextureDim::Cube => 3,
+        }
+    }
+
+    /// Components of `textureDimensions`: a cube face's width and height.
+    pub fn extent(self) -> u8 {
+        match self {
+            TextureDim::D1 => 1,
+            TextureDim::D2 | TextureDim::Cube => 2,
+            TextureDim::D3 => 3,
+        }
+    }
+}
+
+/// The channel type of a storage texel format, or `None` for a name WGSL does not define.
+pub fn texel_format_scalar(format: &str) -> Option<Scalar> {
+    Some(match format {
+        "rgba8unorm" | "rgba8snorm" | "bgra8unorm" | "rgba16float" | "r32float" | "rg32float"
+        | "rgba32float" | "r8unorm" | "rg8unorm" | "r16float" | "rg16float" | "rgb10a2unorm"
+        | "rg11b10ufloat" => Scalar::F32,
+        "rgba8sint" | "rgba16sint" | "r32sint" | "rg32sint" | "rgba32sint" | "r8sint"
+        | "rg8sint" | "r16sint" | "rg16sint" => Scalar::I32,
+        "rgba8uint" | "rgba16uint" | "r32uint" | "rg32uint" | "rgba32uint" | "r8uint"
+        | "rg8uint" | "r16uint" | "rg16uint" | "rgb10a2uint" => Scalar::U32,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TextureKind {
     Sampled {

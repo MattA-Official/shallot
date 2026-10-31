@@ -335,6 +335,22 @@ pub enum BuiltinFn {
     StorageBarrier,
     // Arrays.
     ArrayLength,
+    // Textures. Arguments keep WGSL's order; which optional ones are present follows from the
+    // texture's type (arrayed, depth, multisampled) and the argument count.
+    TextureSample,
+    TextureSampleBias,
+    TextureSampleLevel,
+    TextureSampleGrad,
+    TextureSampleCompare,
+    TextureSampleCompareLevel,
+    TextureGather,
+    TextureGatherCompare,
+    TextureLoad,
+    TextureStore,
+    TextureDimensions,
+    TextureNumLayers,
+    TextureNumLevels,
+    TextureNumSamples,
 }
 
 impl BuiltinFn {
@@ -413,8 +429,45 @@ impl BuiltinFn {
             "workgroupBarrier" => WorkgroupBarrier,
             "storageBarrier" => StorageBarrier,
             "arrayLength" => ArrayLength,
+            "textureSample" => TextureSample,
+            "textureSampleBias" => TextureSampleBias,
+            "textureSampleLevel" => TextureSampleLevel,
+            "textureSampleGrad" => TextureSampleGrad,
+            "textureSampleCompare" => TextureSampleCompare,
+            "textureSampleCompareLevel" => TextureSampleCompareLevel,
+            "textureGather" => TextureGather,
+            "textureGatherCompare" => TextureGatherCompare,
+            "textureLoad" => TextureLoad,
+            "textureStore" => TextureStore,
+            "textureDimensions" => TextureDimensions,
+            "textureNumLayers" => TextureNumLayers,
+            "textureNumLevels" => TextureNumLevels,
+            "textureNumSamples" => TextureNumSamples,
             _ => return None,
         })
+    }
+}
+
+impl BuiltinFn {
+    pub fn is_texture(self) -> bool {
+        use BuiltinFn::*;
+        matches!(
+            self,
+            TextureSample
+                | TextureSampleBias
+                | TextureSampleLevel
+                | TextureSampleGrad
+                | TextureSampleCompare
+                | TextureSampleCompareLevel
+                | TextureGather
+                | TextureGatherCompare
+                | TextureLoad
+                | TextureStore
+                | TextureDimensions
+                | TextureNumLayers
+                | TextureNumLevels
+                | TextureNumSamples
+        )
     }
 }
 

@@ -5,7 +5,10 @@
 //! transitions and barriers inserted from tracked state, and keeps the resources alive until
 //! the submission's fence signals.
 
-use super::resource::{BufferShared, RenderPipelineShared, TextureShared, TextureViewShared};
+use super::binding::{BindGroupShared, Bound, PipelineLayoutShared};
+use super::resource::{
+    BufferShared, ComputePipelineShared, RenderPipelineShared, TextureShared, TextureViewShared,
+};
 use super::{check, conv, vk, Device, DeviceShared, DeviceState, Submission};
 use crate::*;
 use std::future::Future;
@@ -51,6 +54,14 @@ pub(crate) enum Command {
     BeginRenderPass(PassRecord),
     EndRenderPass,
     SetPipeline(Arc<RenderPipelineShared>),
+    BeginComputePass,
+    EndComputePass,
+    SetComputePipeline(Arc<ComputePipelineShared>),
+    SetBindGroup {
+        index: u32,
+        group: Arc<BindGroupShared>,
+        offsets: Vec<u32>,
+    },
     SetVertexBuffer {
         slot: u32,
         buffer: Arc<BufferShared>,
@@ -77,6 +88,19 @@ pub(crate) enum Command {
         first_index: u32,
         base_vertex: i32,
         first_instance: u32,
+    },
+    DrawIndirect {
+        buffer: Arc<BufferShared>,
+        offset: u64,
+    },
+    DrawIndexedIndirect {
+        buffer: Arc<BufferShared>,
+        offset: u64,
+    },
+    Dispatch([u32; 3]),
+    DispatchIndirect {
+        buffer: Arc<BufferShared>,
+        offset: u64,
     },
     CopyBufferToBuffer {
         src: Arc<BufferShared>,
@@ -119,9 +143,12 @@ impl Command {
                 }
                 Ok(())
             }
-            Command::SetVertexBuffer { buffer, .. } | Command::SetIndexBuffer { buffer, .. } => {
-                buffer.usable()
-            }
+            Command::SetVertexBuffer { buffer, .. }
+            | Command::SetIndexBuffer { buffer, .. }
+            | Command::DrawIndirect { buffer, .. }
+            | Command::DrawIndexedIndirect { buffer, .. }
+            | Command::DispatchIndirect { buffer, .. } => buffer.usable(),
+            Command::SetBindGroup { group, .. } => group.usable(),
             Command::CopyBufferToBuffer { src, dst, .. } => {
                 src.usable()?;
                 dst.usable()
@@ -420,12 +447,27 @@ impl CommandEncoder {
         RenderPassEncoder {
             encoder: self,
             pipeline: None,
+            binds: BindState::default(),
             vertex_buffers: 0,
             index: None,
             color_formats,
             depth_format,
             sample_count: sample_count.unwrap_or(1),
             extent,
+            ended: false,
+        }
+    }
+
+    /// `beginComputePass`. The pass borrows the encoder until it ends.
+    pub fn begin_compute_pass(
+        &mut self,
+        _desc: &ComputePassDescriptor<'_>,
+    ) -> ComputePassEncoder<'_> {
+        self.commands.push(Command::BeginComputePass);
+        ComputePassEncoder {
+            encoder: self,
+            pipeline: None,
+            binds: BindState::default(),
             ended: false,
         }
     }
@@ -561,6 +603,7 @@ impl CommandEncoder {
 pub struct RenderPassEncoder<'a> {
     encoder: &'a mut CommandEncoder,
     pipeline: Option<Arc<RenderPipelineShared>>,
+    binds: BindState,
     vertex_buffers: u32,
     index: Option<(IndexFormat, u64)>,
     color_formats: Vec<Option<TextureFormat>>,
@@ -725,11 +768,27 @@ impl RenderPassEncoder<'_> {
             .push(Command::SetStencilReference(reference));
     }
 
+    /// `setBindGroup`. `None` unsets the group.
+    pub fn set_bind_group(&mut self, index: u32, group: Option<&BindGroup>, offsets: &[u32]) {
+        match self.binds.set(&self.encoder.device, index, group, offsets) {
+            Ok(Some(command)) => self.encoder.commands.push(command),
+            Ok(None) => {}
+            Err(e) => self.fail(e),
+        }
+    }
+
     fn check_draw(&mut self) -> bool {
         let Some(pipeline) = &self.pipeline else {
             self.fail("draw called without a pipeline set");
             return false;
         };
+        if let Some(layout) = &pipeline.layout {
+            if let Err(e) = self.binds.check(layout) {
+                let message = format!("{}: {e}", pipeline.describe());
+                self.fail(message);
+                return false;
+            }
+        }
         let needed = (1u32 << pipeline.vertex_buffers) - 1;
         if self.vertex_buffers & needed != needed {
             self.fail(format!(
@@ -787,6 +846,37 @@ impl RenderPassEncoder<'_> {
         }
     }
 
+    /// `drawIndirect`: the arguments are four `u32`s at `offset` in `buffer`.
+    pub fn draw_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        if !self.check_draw() {
+            return;
+        }
+        match indirect_buffer(buffer, offset, 16) {
+            Ok(buffer) => self
+                .encoder
+                .commands
+                .push(Command::DrawIndirect { buffer, offset }),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// `drawIndexedIndirect`: the arguments are five 32-bit values at `offset` in `buffer`.
+    pub fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        if !self.check_draw() {
+            return;
+        }
+        if self.index.is_none() {
+            return self.fail("drawIndexedIndirect called without an index buffer set");
+        }
+        match indirect_buffer(buffer, offset, 20) {
+            Ok(buffer) => self
+                .encoder
+                .commands
+                .push(Command::DrawIndexedIndirect { buffer, offset }),
+            Err(e) => self.fail(e),
+        }
+    }
+
     /// `end`.
     pub fn end(mut self) {
         self.finish_pass();
@@ -801,6 +891,200 @@ impl RenderPassEncoder<'_> {
 }
 
 impl Drop for RenderPassEncoder<'_> {
+    fn drop(&mut self) {
+        self.finish_pass();
+    }
+}
+
+/// Checks an indirect argument buffer and range.
+fn indirect_buffer(buffer: &Buffer, offset: u64, size: u64) -> Result<Arc<BufferShared>, String> {
+    let b = &buffer.shared;
+    if !b.usage.contains(BufferUsage::INDIRECT) {
+        return Err(format!("{} lacks INDIRECT usage", b.describe()));
+    }
+    if !offset.is_multiple_of(4) || offset + size > b.size {
+        return Err("the indirect offset is misaligned or out of bounds".into());
+    }
+    Ok(b.clone())
+}
+
+/// The bind groups set in a pass, for draw- and dispatch-time validation.
+#[derive(Default)]
+struct BindState {
+    groups: Vec<Option<Arc<BindGroupShared>>>,
+}
+
+impl BindState {
+    fn set(
+        &mut self,
+        device: &DeviceShared,
+        index: u32,
+        group: Option<&BindGroup>,
+        offsets: &[u32],
+    ) -> Result<Option<Command>, String> {
+        let limits = &device.limits;
+        if index >= limits.max_bind_groups {
+            return Err(format!("bind group index {index} is out of range"));
+        }
+        let slot = index as usize;
+        if self.groups.len() <= slot {
+            self.groups.resize(slot + 1, None);
+        }
+        let Some(group) = group else {
+            self.groups[slot] = None;
+            return Ok(None);
+        };
+        let g = &group.shared;
+        if !g.valid {
+            return Err(format!("{} is invalid", g.describe()));
+        }
+        let dynamic: Vec<_> = g.dynamic_buffers().collect();
+        if dynamic.len() != offsets.len() {
+            return Err(format!(
+                "{} needs {} dynamic offsets, {} were given",
+                g.describe(),
+                dynamic.len(),
+                offsets.len()
+            ));
+        }
+        for ((buffer, offset, size, ty), &dynamic) in dynamic.iter().zip(offsets) {
+            let alignment = match ty {
+                BufferBindingType::Uniform => limits.min_uniform_buffer_offset_alignment,
+                _ => limits.min_storage_buffer_offset_alignment,
+            };
+            if dynamic % alignment != 0 {
+                return Err(format!(
+                    "dynamic offset {dynamic} is not a multiple of {alignment}"
+                ));
+            }
+            if offset + size + dynamic as u64 > buffer.size {
+                return Err(format!(
+                    "dynamic offset {dynamic} puts the binding past the end of {}",
+                    buffer.describe()
+                ));
+            }
+        }
+        self.groups[slot] = Some(g.clone());
+        Ok(Some(Command::SetBindGroup {
+            index,
+            group: g.clone(),
+            offsets: offsets.to_vec(),
+        }))
+    }
+
+    /// Checks that every group the layout has is set, with an equivalent layout.
+    fn check(&self, layout: &PipelineLayoutShared) -> Result<(), String> {
+        for (index, needed) in layout.groups.iter().enumerate() {
+            match self.groups.get(index).and_then(|g| g.as_ref()) {
+                None => return Err(format!("no bind group is set at index {index}")),
+                Some(group) if !group.layout.equivalent(needed) => {
+                    return Err(format!(
+                        "{} at index {index} does not match the pipeline's layout",
+                        group.describe()
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `GPUComputePassEncoder`. Ends when [`ComputePassEncoder::end`] is called or it is dropped.
+pub struct ComputePassEncoder<'a> {
+    encoder: &'a mut CommandEncoder,
+    pipeline: Option<Arc<ComputePipelineShared>>,
+    binds: BindState,
+    ended: bool,
+}
+
+impl ComputePassEncoder<'_> {
+    fn fail(&mut self, message: impl Into<String>) {
+        self.encoder.fail(message);
+    }
+
+    /// `setPipeline`.
+    pub fn set_pipeline(&mut self, pipeline: &ComputePipeline) {
+        let p = &pipeline.shared;
+        if !p.valid {
+            return self.fail(format!("{} is invalid", p.describe()));
+        }
+        self.pipeline = Some(p.clone());
+        self.encoder
+            .commands
+            .push(Command::SetComputePipeline(p.clone()));
+    }
+
+    /// `setBindGroup`. `None` unsets the group.
+    pub fn set_bind_group(&mut self, index: u32, group: Option<&BindGroup>, offsets: &[u32]) {
+        match self.binds.set(&self.encoder.device, index, group, offsets) {
+            Ok(Some(command)) => self.encoder.commands.push(command),
+            Ok(None) => {}
+            Err(e) => self.fail(e),
+        }
+    }
+
+    fn check_dispatch(&mut self) -> bool {
+        let Some(pipeline) = &self.pipeline else {
+            self.fail("dispatch called without a pipeline set");
+            return false;
+        };
+        if let Some(layout) = &pipeline.layout {
+            if let Err(e) = self.binds.check(layout) {
+                let message = format!("{}: {e}", pipeline.describe());
+                self.fail(message);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `dispatchWorkgroups`.
+    pub fn dispatch_workgroups(&mut self, x: u32, y: u32, z: u32) {
+        if !self.check_dispatch() {
+            return;
+        }
+        let max = self
+            .encoder
+            .device
+            .limits
+            .max_compute_workgroups_per_dimension;
+        if x > max || y > max || z > max {
+            return self.fail(format!(
+                "dispatches are limited to {max} workgroups per dimension"
+            ));
+        }
+        self.encoder.commands.push(Command::Dispatch([x, y, z]));
+    }
+
+    /// `dispatchWorkgroupsIndirect`: the counts are three `u32`s at `offset` in `buffer`.
+    pub fn dispatch_workgroups_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        if !self.check_dispatch() {
+            return;
+        }
+        match indirect_buffer(buffer, offset, 12) {
+            Ok(buffer) => self
+                .encoder
+                .commands
+                .push(Command::DispatchIndirect { buffer, offset }),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// `end`.
+    pub fn end(mut self) {
+        self.finish_pass();
+    }
+
+    fn finish_pass(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            self.encoder.commands.push(Command::EndComputePass);
+        }
+    }
+}
+
+impl Drop for ComputePassEncoder<'_> {
     fn drop(&mut self) {
         self.finish_pass();
     }
@@ -1021,8 +1305,8 @@ impl DeviceShared {
             let writes = std::mem::take(&mut state.pending_writes);
             recorder.pending_writes(&writes);
             for list in &lists {
-                for command in list {
-                    recorder.command(command);
+                for (i, command) in list.iter().enumerate() {
+                    recorder.command(command, &list[i + 1..]);
                 }
             }
             if let Some((texture, _)) = present {
@@ -1096,6 +1380,11 @@ struct Recorder<'d> {
     waits: Vec<vk::Semaphore>,
     buffers: Vec<Arc<BufferShared>>,
     in_pass: bool,
+    /// The pass's bind groups and the current pipeline's layout, bound lazily at each draw
+    /// or dispatch because Vulkan binds sets against a pipeline layout.
+    groups: Vec<Option<(Arc<BindGroupShared>, Vec<u32>)>>,
+    layout: Option<Arc<PipelineLayoutShared>>,
+    binds_dirty: bool,
 }
 
 impl<'d> Recorder<'d> {
@@ -1107,6 +1396,9 @@ impl<'d> Recorder<'d> {
             waits: Vec::new(),
             buffers: Vec::new(),
             in_pass: false,
+            groups: Vec::new(),
+            layout: None,
+            binds_dirty: false,
         }
     }
 
@@ -1239,20 +1531,105 @@ impl<'d> Recorder<'d> {
         }
     }
 
-    fn command(&mut self, command: &Command) {
+    /// Textures bound through the pass's bind groups, which live in the `GENERAL` layout.
+    fn bound_textures(
+        groups: impl Iterator<Item = Arc<BindGroupShared>>,
+    ) -> Vec<Arc<TextureShared>> {
+        let mut textures: Vec<Arc<TextureShared>> = Vec::new();
+        for group in groups {
+            for resource in &group.resources {
+                if let Bound::Texture(view) = resource {
+                    if !textures.iter().any(|t| Arc::ptr_eq(t, &view.texture)) {
+                        textures.push(view.texture.clone());
+                    }
+                }
+            }
+        }
+        textures
+    }
+
+    /// Binds the pass's groups against the current pipeline's layout, if they changed.
+    fn flush_binds(&mut self, bind_point: i32) {
+        if !self.binds_dirty {
+            return;
+        }
+        self.binds_dirty = false;
+        let Some(layout) = &self.layout else { return };
+        for (index, slot) in self.groups.iter().enumerate().take(layout.groups.len()) {
+            if let Some((group, offsets)) = slot {
+                unsafe {
+                    (self.device.fns.cmd_bind_descriptor_sets)(
+                        self.cmd,
+                        bind_point,
+                        layout.raw,
+                        index as u32,
+                        1,
+                        &group.set,
+                        offsets.len() as u32,
+                        offsets.as_ptr(),
+                    )
+                };
+            }
+        }
+    }
+
+    fn command(&mut self, command: &Command, rest: &[Command]) {
         let fns = &self.device.fns;
         let cmd = self.cmd;
         unsafe {
             match command {
-                Command::BeginRenderPass(pass) => self.begin_pass(pass),
+                Command::BeginRenderPass(pass) => {
+                    let groups = rest
+                        .iter()
+                        .take_while(|c| !matches!(c, Command::EndRenderPass))
+                        .filter_map(|c| match c {
+                            Command::SetBindGroup { group, .. } => Some(group.clone()),
+                            _ => None,
+                        });
+                    let general = Self::bound_textures(groups);
+                    self.groups.clear();
+                    self.layout = None;
+                    self.begin_pass(pass, &general);
+                }
                 Command::EndRenderPass => {
                     if self.in_pass {
                         (self.device.rendering.cmd_end_rendering)(cmd);
                         self.in_pass = false;
                     }
                 }
+                Command::BeginComputePass => {
+                    self.groups.clear();
+                    self.layout = None;
+                }
+                Command::EndComputePass => {}
                 Command::SetPipeline(p) => {
-                    (fns.cmd_bind_pipeline)(cmd, vk::PIPELINE_BIND_POINT_GRAPHICS, p.raw)
+                    (fns.cmd_bind_pipeline)(cmd, vk::PIPELINE_BIND_POINT_GRAPHICS, p.raw);
+                    self.layout = p.layout.clone();
+                    self.binds_dirty = true;
+                }
+                Command::SetComputePipeline(p) => {
+                    (fns.cmd_bind_pipeline)(cmd, vk::PIPELINE_BIND_POINT_COMPUTE, p.raw);
+                    self.layout = p.layout.clone();
+                    self.binds_dirty = true;
+                }
+                Command::SetBindGroup {
+                    index,
+                    group,
+                    offsets,
+                } => {
+                    for resource in &group.resources {
+                        match resource {
+                            Bound::Buffer { buffer, .. } => self.use_buffer(buffer),
+                            Bound::Texture(view) => self.use_texture(&view.texture),
+                            Bound::Sampler(_) => {}
+                        }
+                    }
+                    let slot = *index as usize;
+                    if self.groups.len() <= slot {
+                        self.groups.resize(slot + 1, None);
+                    }
+                    self.groups[slot] = Some((group.clone(), offsets.clone()));
+                    self.binds_dirty = true;
                 }
                 Command::SetVertexBuffer {
                     slot,
@@ -1283,27 +1660,52 @@ impl<'d> Recorder<'d> {
                     instance_count,
                     first_vertex,
                     first_instance,
-                } => (fns.cmd_draw)(
-                    cmd,
-                    *vertex_count,
-                    *instance_count,
-                    *first_vertex,
-                    *first_instance,
-                ),
+                } => {
+                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
+                    (fns.cmd_draw)(
+                        cmd,
+                        *vertex_count,
+                        *instance_count,
+                        *first_vertex,
+                        *first_instance,
+                    )
+                }
                 Command::DrawIndexed {
                     index_count,
                     instance_count,
                     first_index,
                     base_vertex,
                     first_instance,
-                } => (fns.cmd_draw_indexed)(
-                    cmd,
-                    *index_count,
-                    *instance_count,
-                    *first_index,
-                    *base_vertex,
-                    *first_instance,
-                ),
+                } => {
+                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
+                    (fns.cmd_draw_indexed)(
+                        cmd,
+                        *index_count,
+                        *instance_count,
+                        *first_index,
+                        *base_vertex,
+                        *first_instance,
+                    )
+                }
+                Command::DrawIndirect { buffer, offset } => {
+                    self.use_buffer(buffer);
+                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
+                    (fns.cmd_draw_indirect)(cmd, buffer.raw, *offset, 1, 16);
+                }
+                Command::DrawIndexedIndirect { buffer, offset } => {
+                    self.use_buffer(buffer);
+                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
+                    (fns.cmd_draw_indexed_indirect)(cmd, buffer.raw, *offset, 1, 20);
+                }
+                Command::Dispatch([x, y, z]) => {
+                    self.before_dispatch();
+                    (fns.cmd_dispatch)(cmd, *x, *y, *z);
+                }
+                Command::DispatchIndirect { buffer, offset } => {
+                    self.use_buffer(buffer);
+                    self.before_dispatch();
+                    (fns.cmd_dispatch_indirect)(cmd, buffer.raw, *offset);
+                }
                 Command::CopyBufferToBuffer {
                     src,
                     src_offset,
@@ -1359,28 +1761,61 @@ impl<'d> Recorder<'d> {
         }
     }
 
-    fn begin_pass(&mut self, pass: &PassRecord) {
-        let mut transitions = Vec::new();
+    /// Waits for earlier work and moves the bound textures to `GENERAL` before a dispatch.
+    fn before_dispatch(&mut self) {
+        let count = self.layout.as_ref().map_or(0, |l| l.groups.len());
+        let groups: Vec<_> = self
+            .groups
+            .iter()
+            .take(count)
+            .flatten()
+            .map(|(g, _)| g.clone())
+            .collect();
+        let transitions: Vec<_> = Self::bound_textures(groups.into_iter())
+            .into_iter()
+            .map(|t| (t, vk::IMAGE_LAYOUT_GENERAL))
+            .collect();
+        self.barrier(&transitions);
+        self.flush_binds(vk::PIPELINE_BIND_POINT_COMPUTE);
+    }
+
+    /// `general` holds the textures the pass also binds: they use the `GENERAL` layout
+    /// throughout, attachments among them included.
+    fn begin_pass(&mut self, pass: &PassRecord, general: &[Arc<TextureShared>]) {
+        let layout_of = |texture: &Arc<TextureShared>, optimal: i32| {
+            if general.iter().any(|t| Arc::ptr_eq(t, texture)) {
+                vk::IMAGE_LAYOUT_GENERAL
+            } else {
+                optimal
+            }
+        };
+        let color_layout = |view: &TextureViewShared| {
+            layout_of(&view.texture, vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+        };
+        let mut transitions: Vec<(Arc<TextureShared>, i32)> = general
+            .iter()
+            .map(|t| (t.clone(), vk::IMAGE_LAYOUT_GENERAL))
+            .collect();
+        for texture in general {
+            self.use_texture(texture);
+        }
         for color in pass.colors.iter().flatten() {
             self.use_texture(&color.view.texture);
-            transitions.push((
-                color.view.texture.clone(),
-                vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            ));
+            transitions.push((color.view.texture.clone(), color_layout(&color.view)));
             if let Some(resolve) = &color.resolve {
                 self.use_texture(&resolve.texture);
-                transitions.push((
-                    resolve.texture.clone(),
-                    vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                ));
+                transitions.push((resolve.texture.clone(), color_layout(resolve)));
             }
         }
-        if let Some(depth) = &pass.depth {
-            self.use_texture(&depth.view.texture);
-            transitions.push((
-                depth.view.texture.clone(),
+        let depth_layout = pass.depth.as_ref().map(|d| {
+            layout_of(
+                &d.view.texture,
                 vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            ));
+            )
+        });
+        if let (Some(depth), Some(layout)) = (&pass.depth, depth_layout) {
+            self.use_texture(&depth.view.texture);
+            transitions.push((depth.view.texture.clone(), layout));
         }
         self.barrier(&transitions);
 
@@ -1392,14 +1827,17 @@ impl<'d> Recorder<'d> {
                     s_type: vk::STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                     p_next: std::ptr::null(),
                     image_view: c.view.raw,
-                    image_layout: vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    image_layout: color_layout(&c.view),
                     resolve_mode: if c.resolve.is_some() {
                         vk::RESOLVE_MODE_AVERAGE_BIT
                     } else {
                         vk::RESOLVE_MODE_NONE
                     },
                     resolve_image_view: c.resolve.as_ref().map_or(0, |r| r.raw),
-                    resolve_image_layout: vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    resolve_image_layout: c
+                        .resolve
+                        .as_ref()
+                        .map_or(vk::IMAGE_LAYOUT_UNDEFINED, |r| color_layout(r)),
                     load_op: match c.load {
                         LoadOp::Clear(_) => vk::ATTACHMENT_LOAD_OP_CLEAR,
                         LoadOp::Load => vk::ATTACHMENT_LOAD_OP_LOAD,
@@ -1484,7 +1922,7 @@ impl<'d> Recorder<'d> {
                     s_type: vk::STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                     p_next: std::ptr::null(),
                     image_view: d.view.raw,
-                    image_layout: vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    image_layout: depth_layout.unwrap(),
                     resolve_mode: vk::RESOLVE_MODE_NONE,
                     resolve_image_view: 0,
                     resolve_image_layout: vk::IMAGE_LAYOUT_UNDEFINED,
