@@ -1,15 +1,15 @@
-//! Command encoding, the queue, and translation of recorded commands to Vulkan.
+//! Command encoding and the queue.
 //!
 //! Encoders record backend-independent commands holding references to the resources they use.
-//! `Queue::submit` validates them, translates them into one Vulkan command buffer with layout
-//! transitions and barriers inserted from tracked state, and keeps the resources alive until
-//! the submission's fence signals.
+//! `Queue::submit` validates them, hands them to the backend to record and submit, and keeps
+//! the resources alive until the submission completes.
 
 use super::binding::{BindGroupShared, Bound, PipelineLayoutShared};
 use super::resource::{
     BufferShared, ComputePipelineShared, RenderPipelineShared, TextureShared, TextureViewShared,
 };
-use super::{check, conv, vk, Device, DeviceShared, DeviceState, Submission};
+use super::{Device, DeviceShared, DeviceState, Submission};
+use crate::hal;
 use crate::*;
 use std::future::Future;
 use std::pin::Pin;
@@ -27,27 +27,27 @@ pub(crate) enum PendingWrite {
     Texture {
         staging: Arc<BufferShared>,
         texture: Arc<TextureShared>,
-        region: vk::BufferImageCopy,
+        copy: hal::TexelCopy,
     },
 }
 
 pub(crate) struct ColorRecord {
-    view: Arc<TextureViewShared>,
-    resolve: Option<Arc<TextureViewShared>>,
-    load: LoadOp<Color>,
-    store: StoreOp,
+    pub view: Arc<TextureViewShared>,
+    pub resolve: Option<Arc<TextureViewShared>>,
+    pub load: LoadOp<Color>,
+    pub store: StoreOp,
 }
 
 pub(crate) struct DepthRecord {
-    view: Arc<TextureViewShared>,
-    depth: Option<(LoadOp<f32>, StoreOp)>,
-    stencil: Option<(LoadOp<u32>, StoreOp)>,
+    pub view: Arc<TextureViewShared>,
+    pub depth: Option<(LoadOp<f32>, StoreOp)>,
+    pub stencil: Option<(LoadOp<u32>, StoreOp)>,
 }
 
 pub(crate) struct PassRecord {
-    colors: Vec<Option<ColorRecord>>,
-    depth: Option<DepthRecord>,
-    extent: (u32, u32),
+    pub colors: Vec<Option<ColorRecord>>,
+    pub depth: Option<DepthRecord>,
+    pub extent: (u32, u32),
 }
 
 pub(crate) enum Command {
@@ -72,8 +72,21 @@ pub(crate) enum Command {
         format: IndexFormat,
         offset: u64,
     },
-    SetViewport(vk::Viewport),
-    SetScissor(vk::Rect2D),
+    /// In framebuffer coordinates, y down; backends flip as they need.
+    SetViewport {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        min_depth: f32,
+        max_depth: f32,
+    },
+    SetScissor {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
     SetBlendConstant([f32; 4]),
     SetStencilReference(u32),
     Draw {
@@ -112,20 +125,14 @@ pub(crate) enum Command {
     CopyBufferToTexture {
         buffer: Arc<BufferShared>,
         texture: Arc<TextureShared>,
-        region: vk::BufferImageCopy,
+        copy: hal::TexelCopy,
     },
     CopyTextureToBuffer {
         texture: Arc<TextureShared>,
         buffer: Arc<BufferShared>,
-        region: vk::BufferImageCopy,
+        copy: hal::TexelCopy,
     },
 }
-
-// Commands only hold `Arc`s of `Send + Sync` resources and plain Vulkan structs.
-unsafe impl Send for Command {}
-unsafe impl Sync for Command {}
-unsafe impl Send for PendingWrite {}
-unsafe impl Sync for PendingWrite {}
 
 impl Command {
     /// Checks that every resource the command uses is still usable at submit time.
@@ -198,7 +205,7 @@ impl Device {
 }
 
 /// Bytes per texel block for one aspect of a format, for copies.
-fn copy_block_size(format: TextureFormat, aspect: TextureAspect) -> Option<u32> {
+pub(crate) fn copy_block_size(format: TextureFormat, aspect: TextureAspect) -> Option<u32> {
     use TextureFormat::*;
     match (format, aspect) {
         (Depth32Float | Depth32FloatStencil8, TextureAspect::DepthOnly)
@@ -212,7 +219,7 @@ fn copy_block_size(format: TextureFormat, aspect: TextureAspect) -> Option<u32> 
     }
 }
 
-/// Validates a buffer-texture copy and builds its Vulkan region. `strict_rows` applies the
+/// Validates a buffer-texture copy and describes it for the backend. `strict_rows` applies the
 /// 256-byte `bytesPerRow` rule of encoder copies.
 fn texel_copy_region(
     buffer_size: u64,
@@ -221,7 +228,7 @@ fn texel_copy_region(
     texture: &TexelCopyTextureInfo<'_>,
     size: Extent3d,
     strict_rows: bool,
-) -> Result<vk::BufferImageCopy, String> {
+) -> Result<hal::TexelCopy, String> {
     let tex = &texture.texture.shared;
     tex.usable()?;
     let block = copy_block_size(tex.format, texture.aspect).ok_or_else(|| {
@@ -292,27 +299,14 @@ fn texel_copy_region(
             layout.offset + needed
         ));
     }
-    let is_3d = tex.dimension == TextureDimension::D3;
-    Ok(vk::BufferImageCopy {
+    Ok(hal::TexelCopy {
         buffer_offset: layout.offset,
-        buffer_row_length: (bytes_per_row / block as u64) as u32,
-        buffer_image_height: rows_per_image as u32,
-        image_subresource: vk::ImageSubresourceLayers {
-            aspect_mask: conv::aspect_mask(tex.format, texture.aspect),
-            mip_level: texture.mip_level,
-            base_array_layer: if is_3d { 0 } else { o.z },
-            layer_count: if is_3d { 1 } else { size.depth_or_array_layers },
-        },
-        image_offset: vk::Offset3D {
-            x: o.x as i32,
-            y: o.y as i32,
-            z: if is_3d { o.z as i32 } else { 0 },
-        },
-        image_extent: vk::Extent3D {
-            width: size.width,
-            height: size.height,
-            depth: if is_3d { size.depth_or_array_layers } else { 1 },
-        },
+        bytes_per_row: bytes_per_row as u32,
+        rows_per_image: rows_per_image as u32,
+        mip_level: texture.mip_level,
+        origin: o,
+        size,
+        aspect: texture.aspect,
     })
 }
 
@@ -537,10 +531,10 @@ impl CommandEncoder {
             size,
             true,
         ) {
-            Ok(region) => self.commands.push(Command::CopyBufferToTexture {
+            Ok(copy) => self.commands.push(Command::CopyBufferToTexture {
                 buffer: buffer.clone(),
                 texture: dst.texture.shared.clone(),
-                region,
+                copy,
             }),
             Err(e) => self.fail(e),
         }
@@ -571,10 +565,10 @@ impl CommandEncoder {
             size,
             true,
         ) {
-            Ok(region) => self.commands.push(Command::CopyTextureToBuffer {
+            Ok(copy) => self.commands.push(Command::CopyTextureToBuffer {
                 texture: src.texture.shared.clone(),
                 buffer: buffer.clone(),
-                region,
+                copy,
             }),
             Err(e) => self.fail(e),
         }
@@ -723,17 +717,14 @@ impl RenderPassEncoder<'_> {
         {
             return self.fail("viewport depths must satisfy 0 <= minDepth <= maxDepth <= 1");
         }
-        // Flipped so that clip-space +y is up, as in WebGPU.
-        self.encoder
-            .commands
-            .push(Command::SetViewport(vk::Viewport {
-                x,
-                y: y + height,
-                width,
-                height: -height,
-                min_depth,
-                max_depth,
-            }));
+        self.encoder.commands.push(Command::SetViewport {
+            x,
+            y,
+            width,
+            height,
+            min_depth,
+            max_depth,
+        });
     }
 
     /// `setScissorRect`.
@@ -741,13 +732,12 @@ impl RenderPassEncoder<'_> {
         if x + width > self.extent.0 || y + height > self.extent.1 {
             return self.fail("the scissor rectangle is outside the render targets");
         }
-        self.encoder.commands.push(Command::SetScissor(vk::Rect2D {
-            offset: vk::Offset2D {
-                x: x as i32,
-                y: y as i32,
-            },
-            extent: vk::Extent2D { width, height },
-        }));
+        self.encoder.commands.push(Command::SetScissor {
+            x,
+            y,
+            width,
+            height,
+        });
     }
 
     /// `setBlendConstant`.
@@ -1181,7 +1171,7 @@ impl Queue {
             ));
         }
         // Validate against the caller's layout, then repack rows tightly for the staging copy.
-        let region =
+        let copy =
             match texel_copy_region(data.len() as u64, "the data", &layout, &dst, size, false) {
                 Ok(r) => r,
                 Err(e) => return device.validation(format!("writeTexture: {e}")),
@@ -1205,17 +1195,17 @@ impl Queue {
         if packed.is_empty() {
             return;
         }
-        let region = vk::BufferImageCopy {
+        let copy = hal::TexelCopy {
             buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            ..region
+            bytes_per_row: row as u32,
+            rows_per_image: size.height,
+            ..copy
         };
         match BufferShared::staging(device, &packed) {
             Ok(staging) => device.lock().pending_writes.push(PendingWrite::Texture {
                 staging,
                 texture: texture.clone(),
-                region,
+                copy,
             }),
             Err(e) => device.report(e),
         }
@@ -1268,722 +1258,83 @@ impl DeviceShared {
     }
 
     /// Records and submits command lists (after any queued writes). With `present`, also
-    /// moves that swapchain texture to the present layout and signals the semaphore.
+    /// readies that surface image for presentation.
     pub(crate) fn submit_locked(
         &self,
         state: &mut DeviceState,
         lists: Vec<Vec<Command>>,
-        present: Option<(&Arc<TextureShared>, vk::Semaphore)>,
+        present: Option<hal::Present<'_>>,
     ) -> Result<u64, GpuError> {
         if state.lost {
             return Err(GpuError::Internal("the device was lost".into()));
         }
         self.retire(state);
-        let fns = &self.fns;
-        unsafe {
-            let alloc = vk::CommandBufferAllocateInfo {
-                s_type: vk::STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                p_next: std::ptr::null(),
-                command_pool: state.command_pool,
-                level: vk::COMMAND_BUFFER_LEVEL_PRIMARY,
-                command_buffer_count: 1,
-            };
-            let mut cmd = std::ptr::null_mut();
-            check(
-                (fns.allocate_command_buffers)(self.raw, &alloc, &mut cmd),
-                "vkAllocateCommandBuffers",
-            )?;
-            let begin = vk::CommandBufferBeginInfo {
-                s_type: vk::STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                p_next: std::ptr::null(),
-                flags: vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-                p_inheritance_info: std::ptr::null(),
-            };
-            (fns.begin_command_buffer)(cmd, &begin);
-
-            let mut recorder = Recorder::new(self, cmd);
-            let writes = std::mem::take(&mut state.pending_writes);
-            recorder.pending_writes(&writes);
-            for list in &lists {
-                for (i, command) in list.iter().enumerate() {
-                    recorder.command(command, &list[i + 1..]);
-                }
-            }
-            if let Some((texture, _)) = present {
-                recorder.use_texture(texture);
-                recorder.barrier(&[(texture.clone(), vk::IMAGE_LAYOUT_PRESENT_SRC_KHR)]);
-            }
-            let (waits, buffers) = recorder.finish();
-            check((fns.end_command_buffer)(cmd), "vkEndCommandBuffer")?;
-
-            let fence_info = vk::FenceCreateInfo {
-                s_type: vk::STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-            };
-            let mut fence = 0;
-            check(
-                (fns.create_fence)(self.raw, &fence_info, std::ptr::null(), &mut fence),
-                "vkCreateFence",
-            )?;
-            let wait_stages = vec![vk::PIPELINE_STAGE_ALL_COMMANDS_BIT; waits.len()];
-            let signal: Vec<vk::Semaphore> = present.map(|(_, s)| s).into_iter().collect();
-            let submit = vk::SubmitInfo {
-                s_type: vk::STRUCTURE_TYPE_SUBMIT_INFO,
-                p_next: std::ptr::null(),
-                wait_semaphore_count: waits.len() as u32,
-                p_wait_semaphores: waits.as_ptr(),
-                p_wait_dst_stage_mask: wait_stages.as_ptr(),
-                command_buffer_count: 1,
-                p_command_buffers: &cmd,
-                signal_semaphore_count: signal.len() as u32,
-                p_signal_semaphores: signal.as_ptr(),
-            };
-            let r = (fns.queue_submit)(self.queue, 1, &submit, fence);
-            if r != vk::SUCCESS {
-                (fns.destroy_fence)(self.raw, fence, std::ptr::null());
-                (fns.free_command_buffers)(self.raw, state.command_pool, 1, &cmd);
-                if r == vk::ERROR_DEVICE_LOST {
+        let writes = std::mem::take(&mut state.pending_writes);
+        let presented = present.as_ref().map(|p| p.texture.clone());
+        let raw = match self.raw.submit(&writes, &lists, present) {
+            Ok(raw) => raw,
+            Err(e) => {
+                if e.message() == "the device was lost" {
                     state.lost = true;
                 }
-                return Err(check(r, "vkQueueSubmit").unwrap_err());
+                return Err(e);
             }
-            let index = state.next_index;
-            state.next_index += 1;
-            for buffer in &buffers {
-                buffer.state.lock().unwrap().last_use = index;
-            }
-            let mut resources: Vec<Arc<dyn std::any::Any + Send + Sync>> =
-                vec![Arc::new(lists), Arc::new(writes)];
-            if let Some((texture, _)) = present {
-                resources.push(texture.clone());
-            }
-            state.in_flight.push_back(Submission {
-                index,
-                fence,
-                command_buffer: cmd,
-                resources,
-            });
-            Ok(index)
+        };
+        let index = state.next_index;
+        state.next_index += 1;
+        for_each_buffer(&writes, &lists, |buffer| {
+            buffer.state.lock().unwrap().last_use = index;
+        });
+        let mut resources: Vec<Arc<dyn std::any::Any + Send + Sync>> =
+            vec![Arc::new(lists), Arc::new(writes)];
+        if let Some(texture) = presented {
+            resources.push(texture);
         }
+        state.in_flight.push_back(Submission {
+            index,
+            raw,
+            resources,
+        });
+        Ok(index)
     }
 }
 
-// ------------------------------------------------------------------------------------------
-// Translation to Vulkan
-
-/// Records commands into one Vulkan command buffer, tracking texture layouts as it goes.
-struct Recorder<'d> {
-    device: &'d DeviceShared,
-    cmd: vk::CommandBuffer,
-    layouts: Vec<(Arc<TextureShared>, i32)>,
-    waits: Vec<vk::Semaphore>,
-    buffers: Vec<Arc<BufferShared>>,
-    in_pass: bool,
-    /// The pass's bind groups and the current pipeline's layout, bound lazily at each draw
-    /// or dispatch because Vulkan binds sets against a pipeline layout.
-    groups: Vec<Option<(Arc<BindGroupShared>, Vec<u32>)>>,
-    layout: Option<Arc<PipelineLayoutShared>>,
-    binds_dirty: bool,
-}
-
-impl<'d> Recorder<'d> {
-    fn new(device: &'d DeviceShared, cmd: vk::CommandBuffer) -> Self {
-        Recorder {
-            device,
-            cmd,
-            layouts: Vec::new(),
-            waits: Vec::new(),
-            buffers: Vec::new(),
-            in_pass: false,
-            groups: Vec::new(),
-            layout: None,
-            binds_dirty: false,
-        }
-    }
-
-    fn layout_slot(&mut self, texture: &Arc<TextureShared>) -> usize {
-        if let Some(i) = self
-            .layouts
-            .iter()
-            .position(|(t, _)| Arc::ptr_eq(t, texture))
-        {
-            return i;
-        }
-        let current = *texture.layout.lock().unwrap();
-        self.layouts.push((texture.clone(), current));
-        self.layouts.len() - 1
-    }
-
-    /// Notes a texture's use: swapchain images make the submission wait for their acquire.
-    fn use_texture(&mut self, texture: &Arc<TextureShared>) {
-        if let Some(semaphore) = texture.acquire.lock().unwrap().take() {
-            self.waits.push(semaphore);
-        }
-    }
-
-    fn use_buffer(&mut self, buffer: &Arc<BufferShared>) {
-        if !self.buffers.iter().any(|b| Arc::ptr_eq(b, buffer)) {
-            self.buffers.push(buffer.clone());
-        }
-    }
-
-    /// A full memory barrier plus layout transitions. Conservative: every command waits for
-    /// all earlier work, which is correct and leaves finer tracking for later.
-    fn barrier(&mut self, transitions: &[(Arc<TextureShared>, i32)]) {
-        let mut images = Vec::new();
-        for (texture, new_layout) in transitions {
-            let slot = self.layout_slot(texture);
-            let old = self.layouts[slot].1;
-            if old == *new_layout
-                && images
-                    .iter()
-                    .all(|b: &vk::ImageMemoryBarrier2| b.image != texture.raw)
-            {
-                continue;
+/// Calls `f` for every buffer a submission's writes and commands use.
+fn for_each_buffer(
+    writes: &[PendingWrite],
+    lists: &[Vec<Command>],
+    mut f: impl FnMut(&Arc<BufferShared>),
+) {
+    for write in writes {
+        match write {
+            PendingWrite::Buffer { staging, dst, .. } => {
+                f(staging);
+                f(dst);
             }
-            self.layouts[slot].1 = *new_layout;
-            images.push(vk::ImageMemoryBarrier2 {
-                s_type: vk::STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                p_next: std::ptr::null(),
-                src_stage_mask: vk::PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                src_access_mask: vk::ACCESS_2_MEMORY_WRITE_BIT,
-                dst_stage_mask: vk::PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                dst_access_mask: vk::ACCESS_2_MEMORY_READ_BIT | vk::ACCESS_2_MEMORY_WRITE_BIT,
-                old_layout: old,
-                new_layout: *new_layout,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: texture.raw,
-                subresource_range: texture.full_range(),
-            });
+            PendingWrite::Texture { staging, .. } => f(staging),
         }
-        let memory = vk::MemoryBarrier2 {
-            s_type: vk::STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            p_next: std::ptr::null(),
-            src_stage_mask: vk::PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            src_access_mask: vk::ACCESS_2_MEMORY_WRITE_BIT,
-            dst_stage_mask: vk::PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            dst_access_mask: vk::ACCESS_2_MEMORY_READ_BIT | vk::ACCESS_2_MEMORY_WRITE_BIT,
-        };
-        let dependency = vk::DependencyInfo {
-            s_type: vk::STRUCTURE_TYPE_DEPENDENCY_INFO,
-            p_next: std::ptr::null(),
-            dependency_flags: 0,
-            memory_barrier_count: 1,
-            p_memory_barriers: &memory,
-            buffer_memory_barrier_count: 0,
-            p_buffer_memory_barriers: std::ptr::null(),
-            image_memory_barrier_count: images.len() as u32,
-            p_image_memory_barriers: images.as_ptr(),
-        };
-        unsafe { (self.device.rendering.cmd_pipeline_barrier2)(self.cmd, &dependency) };
     }
-
-    fn pending_writes(&mut self, writes: &[PendingWrite]) {
-        if writes.is_empty() {
-            return;
-        }
-        let textures: Vec<(Arc<TextureShared>, i32)> = writes
-            .iter()
-            .filter_map(|w| match w {
-                PendingWrite::Texture { texture, .. } => {
-                    Some((texture.clone(), vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL))
-                }
-                _ => None,
-            })
-            .collect();
-        self.barrier(&textures);
-        let fns = &self.device.fns;
-        for write in writes {
-            unsafe {
-                match write {
-                    PendingWrite::Buffer {
-                        staging,
-                        dst,
-                        dst_offset,
-                        size,
-                    } => {
-                        self.use_buffer(dst);
-                        let region = vk::BufferCopy {
-                            src_offset: 0,
-                            dst_offset: *dst_offset,
-                            size: *size,
-                        };
-                        (fns.cmd_copy_buffer)(self.cmd, staging.raw, dst.raw, 1, &region);
-                    }
-                    PendingWrite::Texture {
-                        staging,
-                        texture,
-                        region,
-                    } => {
-                        (fns.cmd_copy_buffer_to_image)(
-                            self.cmd,
-                            staging.raw,
-                            texture.raw,
-                            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            1,
-                            region,
-                        );
+    for command in lists.iter().flatten() {
+        match command {
+            Command::SetBindGroup { group, .. } => {
+                for resource in &group.resources {
+                    if let Bound::Buffer { buffer, .. } = resource {
+                        f(buffer);
                     }
                 }
             }
-        }
-    }
-
-    /// Textures bound through the pass's bind groups, which live in the `GENERAL` layout.
-    fn bound_textures(
-        groups: impl Iterator<Item = Arc<BindGroupShared>>,
-    ) -> Vec<Arc<TextureShared>> {
-        let mut textures: Vec<Arc<TextureShared>> = Vec::new();
-        for group in groups {
-            for resource in &group.resources {
-                if let Bound::Texture(view) = resource {
-                    if !textures.iter().any(|t| Arc::ptr_eq(t, &view.texture)) {
-                        textures.push(view.texture.clone());
-                    }
-                }
+            Command::SetVertexBuffer { buffer, .. }
+            | Command::SetIndexBuffer { buffer, .. }
+            | Command::DrawIndirect { buffer, .. }
+            | Command::DrawIndexedIndirect { buffer, .. }
+            | Command::DispatchIndirect { buffer, .. }
+            | Command::CopyBufferToTexture { buffer, .. }
+            | Command::CopyTextureToBuffer { buffer, .. } => f(buffer),
+            Command::CopyBufferToBuffer { src, dst, .. } => {
+                f(src);
+                f(dst);
             }
+            _ => {}
         }
-        textures
-    }
-
-    /// Binds the pass's groups against the current pipeline's layout, if they changed.
-    fn flush_binds(&mut self, bind_point: i32) {
-        if !self.binds_dirty {
-            return;
-        }
-        self.binds_dirty = false;
-        let Some(layout) = &self.layout else { return };
-        for (index, slot) in self.groups.iter().enumerate().take(layout.groups.len()) {
-            if let Some((group, offsets)) = slot {
-                unsafe {
-                    (self.device.fns.cmd_bind_descriptor_sets)(
-                        self.cmd,
-                        bind_point,
-                        layout.raw,
-                        index as u32,
-                        1,
-                        &group.set,
-                        offsets.len() as u32,
-                        offsets.as_ptr(),
-                    )
-                };
-            }
-        }
-    }
-
-    fn command(&mut self, command: &Command, rest: &[Command]) {
-        let fns = &self.device.fns;
-        let cmd = self.cmd;
-        unsafe {
-            match command {
-                Command::BeginRenderPass(pass) => {
-                    let groups = rest
-                        .iter()
-                        .take_while(|c| !matches!(c, Command::EndRenderPass))
-                        .filter_map(|c| match c {
-                            Command::SetBindGroup { group, .. } => Some(group.clone()),
-                            _ => None,
-                        });
-                    let general = Self::bound_textures(groups);
-                    self.groups.clear();
-                    self.layout = None;
-                    self.begin_pass(pass, &general);
-                }
-                Command::EndRenderPass => {
-                    if self.in_pass {
-                        (self.device.rendering.cmd_end_rendering)(cmd);
-                        self.in_pass = false;
-                    }
-                }
-                Command::BeginComputePass => {
-                    self.groups.clear();
-                    self.layout = None;
-                }
-                Command::EndComputePass => {}
-                Command::SetPipeline(p) => {
-                    (fns.cmd_bind_pipeline)(cmd, vk::PIPELINE_BIND_POINT_GRAPHICS, p.raw);
-                    self.layout = p.layout.clone();
-                    self.binds_dirty = true;
-                }
-                Command::SetComputePipeline(p) => {
-                    (fns.cmd_bind_pipeline)(cmd, vk::PIPELINE_BIND_POINT_COMPUTE, p.raw);
-                    self.layout = p.layout.clone();
-                    self.binds_dirty = true;
-                }
-                Command::SetBindGroup {
-                    index,
-                    group,
-                    offsets,
-                } => {
-                    for resource in &group.resources {
-                        match resource {
-                            Bound::Buffer { buffer, .. } => self.use_buffer(buffer),
-                            Bound::Texture(view) => self.use_texture(&view.texture),
-                            Bound::Sampler(_) => {}
-                        }
-                    }
-                    let slot = *index as usize;
-                    if self.groups.len() <= slot {
-                        self.groups.resize(slot + 1, None);
-                    }
-                    self.groups[slot] = Some((group.clone(), offsets.clone()));
-                    self.binds_dirty = true;
-                }
-                Command::SetVertexBuffer {
-                    slot,
-                    buffer,
-                    offset,
-                } => {
-                    self.use_buffer(buffer);
-                    (fns.cmd_bind_vertex_buffers)(cmd, *slot, 1, &buffer.raw, offset);
-                }
-                Command::SetIndexBuffer {
-                    buffer,
-                    format,
-                    offset,
-                } => {
-                    self.use_buffer(buffer);
-                    let kind = match format {
-                        IndexFormat::Uint16 => vk::INDEX_TYPE_UINT16,
-                        IndexFormat::Uint32 => vk::INDEX_TYPE_UINT32,
-                    };
-                    (fns.cmd_bind_index_buffer)(cmd, buffer.raw, *offset, kind);
-                }
-                Command::SetViewport(v) => (fns.cmd_set_viewport)(cmd, 0, 1, v),
-                Command::SetScissor(r) => (fns.cmd_set_scissor)(cmd, 0, 1, r),
-                Command::SetBlendConstant(c) => (fns.cmd_set_blend_constants)(cmd, c),
-                Command::SetStencilReference(r) => (fns.cmd_set_stencil_reference)(cmd, 0x3, *r),
-                Command::Draw {
-                    vertex_count,
-                    instance_count,
-                    first_vertex,
-                    first_instance,
-                } => {
-                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
-                    (fns.cmd_draw)(
-                        cmd,
-                        *vertex_count,
-                        *instance_count,
-                        *first_vertex,
-                        *first_instance,
-                    )
-                }
-                Command::DrawIndexed {
-                    index_count,
-                    instance_count,
-                    first_index,
-                    base_vertex,
-                    first_instance,
-                } => {
-                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
-                    (fns.cmd_draw_indexed)(
-                        cmd,
-                        *index_count,
-                        *instance_count,
-                        *first_index,
-                        *base_vertex,
-                        *first_instance,
-                    )
-                }
-                Command::DrawIndirect { buffer, offset } => {
-                    self.use_buffer(buffer);
-                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
-                    (fns.cmd_draw_indirect)(cmd, buffer.raw, *offset, 1, 16);
-                }
-                Command::DrawIndexedIndirect { buffer, offset } => {
-                    self.use_buffer(buffer);
-                    self.flush_binds(vk::PIPELINE_BIND_POINT_GRAPHICS);
-                    (fns.cmd_draw_indexed_indirect)(cmd, buffer.raw, *offset, 1, 20);
-                }
-                Command::Dispatch([x, y, z]) => {
-                    self.before_dispatch();
-                    (fns.cmd_dispatch)(cmd, *x, *y, *z);
-                }
-                Command::DispatchIndirect { buffer, offset } => {
-                    self.use_buffer(buffer);
-                    self.before_dispatch();
-                    (fns.cmd_dispatch_indirect)(cmd, buffer.raw, *offset);
-                }
-                Command::CopyBufferToBuffer {
-                    src,
-                    src_offset,
-                    dst,
-                    dst_offset,
-                    size,
-                } => {
-                    self.use_buffer(src);
-                    self.use_buffer(dst);
-                    self.barrier(&[]);
-                    let region = vk::BufferCopy {
-                        src_offset: *src_offset,
-                        dst_offset: *dst_offset,
-                        size: *size,
-                    };
-                    (fns.cmd_copy_buffer)(cmd, src.raw, dst.raw, 1, &region);
-                }
-                Command::CopyBufferToTexture {
-                    buffer,
-                    texture,
-                    region,
-                } => {
-                    self.use_buffer(buffer);
-                    self.use_texture(texture);
-                    self.barrier(&[(texture.clone(), vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)]);
-                    (fns.cmd_copy_buffer_to_image)(
-                        cmd,
-                        buffer.raw,
-                        texture.raw,
-                        vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        1,
-                        region,
-                    );
-                }
-                Command::CopyTextureToBuffer {
-                    texture,
-                    buffer,
-                    region,
-                } => {
-                    self.use_buffer(buffer);
-                    self.use_texture(texture);
-                    self.barrier(&[(texture.clone(), vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)]);
-                    (fns.cmd_copy_image_to_buffer)(
-                        cmd,
-                        texture.raw,
-                        vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        buffer.raw,
-                        1,
-                        region,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Waits for earlier work and moves the bound textures to `GENERAL` before a dispatch.
-    fn before_dispatch(&mut self) {
-        let count = self.layout.as_ref().map_or(0, |l| l.groups.len());
-        let groups: Vec<_> = self
-            .groups
-            .iter()
-            .take(count)
-            .flatten()
-            .map(|(g, _)| g.clone())
-            .collect();
-        let transitions: Vec<_> = Self::bound_textures(groups.into_iter())
-            .into_iter()
-            .map(|t| (t, vk::IMAGE_LAYOUT_GENERAL))
-            .collect();
-        self.barrier(&transitions);
-        self.flush_binds(vk::PIPELINE_BIND_POINT_COMPUTE);
-    }
-
-    /// `general` holds the textures the pass also binds: they use the `GENERAL` layout
-    /// throughout, attachments among them included.
-    fn begin_pass(&mut self, pass: &PassRecord, general: &[Arc<TextureShared>]) {
-        let layout_of = |texture: &Arc<TextureShared>, optimal: i32| {
-            if general.iter().any(|t| Arc::ptr_eq(t, texture)) {
-                vk::IMAGE_LAYOUT_GENERAL
-            } else {
-                optimal
-            }
-        };
-        let color_layout = |view: &TextureViewShared| {
-            layout_of(&view.texture, vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-        };
-        let mut transitions: Vec<(Arc<TextureShared>, i32)> = general
-            .iter()
-            .map(|t| (t.clone(), vk::IMAGE_LAYOUT_GENERAL))
-            .collect();
-        for texture in general {
-            self.use_texture(texture);
-        }
-        for color in pass.colors.iter().flatten() {
-            self.use_texture(&color.view.texture);
-            transitions.push((color.view.texture.clone(), color_layout(&color.view)));
-            if let Some(resolve) = &color.resolve {
-                self.use_texture(&resolve.texture);
-                transitions.push((resolve.texture.clone(), color_layout(resolve)));
-            }
-        }
-        let depth_layout = pass.depth.as_ref().map(|d| {
-            layout_of(
-                &d.view.texture,
-                vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            )
-        });
-        if let (Some(depth), Some(layout)) = (&pass.depth, depth_layout) {
-            self.use_texture(&depth.view.texture);
-            transitions.push((depth.view.texture.clone(), layout));
-        }
-        self.barrier(&transitions);
-
-        let colors: Vec<vk::RenderingAttachmentInfo> = pass
-            .colors
-            .iter()
-            .map(|color| match color {
-                Some(c) => vk::RenderingAttachmentInfo {
-                    s_type: vk::STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                    p_next: std::ptr::null(),
-                    image_view: c.view.raw,
-                    image_layout: color_layout(&c.view),
-                    resolve_mode: if c.resolve.is_some() {
-                        vk::RESOLVE_MODE_AVERAGE_BIT
-                    } else {
-                        vk::RESOLVE_MODE_NONE
-                    },
-                    resolve_image_view: c.resolve.as_ref().map_or(0, |r| r.raw),
-                    resolve_image_layout: c
-                        .resolve
-                        .as_ref()
-                        .map_or(vk::IMAGE_LAYOUT_UNDEFINED, |r| color_layout(r)),
-                    load_op: match c.load {
-                        LoadOp::Clear(_) => vk::ATTACHMENT_LOAD_OP_CLEAR,
-                        LoadOp::Load => vk::ATTACHMENT_LOAD_OP_LOAD,
-                    },
-                    store_op: match c.store {
-                        StoreOp::Store => vk::ATTACHMENT_STORE_OP_STORE,
-                        StoreOp::Discard => vk::ATTACHMENT_STORE_OP_DONT_CARE,
-                    },
-                    clear_value: match c.load {
-                        LoadOp::Clear(color) => conv::clear_color(color, c.view.format),
-                        LoadOp::Load => vk::ClearValue {
-                            color_float: [0.0; 4],
-                        },
-                    },
-                },
-                None => vk::RenderingAttachmentInfo {
-                    s_type: vk::STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                    p_next: std::ptr::null(),
-                    image_view: 0,
-                    image_layout: vk::IMAGE_LAYOUT_UNDEFINED,
-                    resolve_mode: vk::RESOLVE_MODE_NONE,
-                    resolve_image_view: 0,
-                    resolve_image_layout: vk::IMAGE_LAYOUT_UNDEFINED,
-                    load_op: vk::ATTACHMENT_LOAD_OP_DONT_CARE,
-                    store_op: vk::ATTACHMENT_STORE_OP_DONT_CARE,
-                    clear_value: vk::ClearValue {
-                        color_float: [0.0; 4],
-                    },
-                },
-            })
-            .collect();
-        let depth_stencil = pass.depth.as_ref().map(|d| {
-            let ops = |load: Option<(i32, vk::ClearValue)>, store: Option<StoreOp>| (load, store);
-            let depth = ops(
-                d.depth.map(|(l, _)| match l {
-                    LoadOp::Clear(v) => (
-                        vk::ATTACHMENT_LOAD_OP_CLEAR,
-                        vk::ClearValue {
-                            depth_stencil: vk::ClearDepthStencilValue {
-                                depth: v,
-                                stencil: 0,
-                            },
-                        },
-                    ),
-                    LoadOp::Load => (
-                        vk::ATTACHMENT_LOAD_OP_LOAD,
-                        vk::ClearValue {
-                            color_float: [0.0; 4],
-                        },
-                    ),
-                }),
-                d.depth.map(|(_, s)| s),
-            );
-            let stencil = ops(
-                d.stencil.map(|(l, _)| match l {
-                    LoadOp::Clear(v) => (
-                        vk::ATTACHMENT_LOAD_OP_CLEAR,
-                        vk::ClearValue {
-                            depth_stencil: vk::ClearDepthStencilValue {
-                                depth: 0.0,
-                                stencil: v,
-                            },
-                        },
-                    ),
-                    LoadOp::Load => (
-                        vk::ATTACHMENT_LOAD_OP_LOAD,
-                        vk::ClearValue {
-                            color_float: [0.0; 4],
-                        },
-                    ),
-                }),
-                d.stencil.map(|(_, s)| s),
-            );
-            let info = |(load, store): (Option<(i32, vk::ClearValue)>, Option<StoreOp>)| {
-                let (load_op, clear_value) = load.unwrap_or((
-                    vk::ATTACHMENT_LOAD_OP_LOAD,
-                    vk::ClearValue {
-                        color_float: [0.0; 4],
-                    },
-                ));
-                vk::RenderingAttachmentInfo {
-                    s_type: vk::STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                    p_next: std::ptr::null(),
-                    image_view: d.view.raw,
-                    image_layout: depth_layout.unwrap(),
-                    resolve_mode: vk::RESOLVE_MODE_NONE,
-                    resolve_image_view: 0,
-                    resolve_image_layout: vk::IMAGE_LAYOUT_UNDEFINED,
-                    load_op,
-                    store_op: match store {
-                        Some(StoreOp::Discard) => vk::ATTACHMENT_STORE_OP_DONT_CARE,
-                        _ => vk::ATTACHMENT_STORE_OP_STORE,
-                    },
-                    clear_value,
-                }
-            };
-            (d.view.format, info(depth), info(stencil))
-        });
-        let (width, height) = pass.extent;
-        let info = vk::RenderingInfo {
-            s_type: vk::STRUCTURE_TYPE_RENDERING_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            render_area: vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
-            },
-            layer_count: 1,
-            view_mask: 0,
-            color_attachment_count: colors.len() as u32,
-            p_color_attachments: colors.as_ptr(),
-            p_depth_attachment: match &depth_stencil {
-                Some((format, depth, _)) if format.has_depth() => depth,
-                _ => std::ptr::null(),
-            },
-            p_stencil_attachment: match &depth_stencil {
-                Some((format, _, stencil)) if format.has_stencil() => stencil,
-                _ => std::ptr::null(),
-            },
-        };
-        let fns = &self.device.fns;
-        unsafe {
-            (self.device.rendering.cmd_begin_rendering)(self.cmd, &info);
-            // WebGPU's defaults: the whole target, clip-space +y up.
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: height as f32,
-                width: width as f32,
-                height: -(height as f32),
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            (fns.cmd_set_viewport)(self.cmd, 0, 1, &viewport);
-            (fns.cmd_set_scissor)(self.cmd, 0, 1, &info.render_area);
-            (fns.cmd_set_blend_constants)(self.cmd, &[0.0; 4]);
-            (fns.cmd_set_stencil_reference)(self.cmd, 0x3, 0);
-        }
-        self.in_pass = true;
-    }
-
-    /// Writes tracked layouts back to the textures and hands back the semaphores to wait on
-    /// and the buffers used.
-    fn finish(self) -> (Vec<vk::Semaphore>, Vec<Arc<BufferShared>>) {
-        for (texture, layout) in &self.layouts {
-            *texture.layout.lock().unwrap() = *layout;
-        }
-        (self.waits, self.buffers)
     }
 }

@@ -1,26 +1,22 @@
-//! The Vulkan backend: instance, adapter and device.
+//! The Vulkan backend: Vulkan 1.1 with dynamic rendering and synchronization2, loaded at run
+//! time.
 
-mod binding;
 mod command;
 mod conv;
 mod resource;
 mod surface;
 pub mod vk;
 
-pub use binding::{BindGroup, BindGroupLayout, PipelineLayout, Sampler};
-pub use command::{CommandBuffer, CommandEncoder, ComputePassEncoder, Queue, RenderPassEncoder};
-pub use resource::{
-    Buffer, BufferView, BufferViewMut, ComputePipeline, MapFuture, RenderPipeline, ShaderModule,
-    Texture, TextureView,
+pub(crate) use resource::{
+    BindGroup, BindGroupLayout, Buffer, ComputePipeline, PipelineLayout, RenderPipeline, Sampler,
+    ShaderModule, Texture, TextureView,
 };
-pub use surface::{Surface, SurfaceCapabilities, SurfaceTexture};
+pub(crate) use surface::Surface;
 
 use crate::*;
 use shallot_platform::Library;
-use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn check(r: vk::Result, what: &str) -> Result<(), GpuError> {
     match r {
@@ -38,7 +34,7 @@ pub(crate) fn check(r: vk::Result, what: &str) -> Result<(), GpuError> {
 // ------------------------------------------------------------------------------------------
 // Instance
 
-pub(crate) struct InstanceShared {
+pub(crate) struct InstanceInner {
     _library: Library,
     pub raw: vk::Instance,
     pub fns: vk::InstanceFns,
@@ -49,19 +45,17 @@ pub(crate) struct InstanceShared {
     pub api_version: u32,
 }
 
-unsafe impl Send for InstanceShared {}
-unsafe impl Sync for InstanceShared {}
+unsafe impl Send for InstanceInner {}
+unsafe impl Sync for InstanceInner {}
 
-impl Drop for InstanceShared {
+impl Drop for InstanceInner {
     fn drop(&mut self) {
         unsafe { (self.fns.destroy_instance)(self.raw, std::ptr::null()) };
     }
 }
 
-/// `navigator.gpu`: the entry point that finds adapters and creates surfaces.
-#[derive(Clone)]
-pub struct Instance {
-    pub(crate) shared: Arc<InstanceShared>,
+pub(crate) struct Instance {
+    pub(crate) inner: Arc<InstanceInner>,
 }
 
 const LOADER_NAMES: &[&str] = if cfg!(windows) {
@@ -81,7 +75,7 @@ const LOADER_NAMES: &[&str] = if cfg!(windows) {
 
 impl Instance {
     /// Opens the Vulkan loader and creates an instance with every surface extension available.
-    pub fn new(desc: &InstanceDescriptor) -> Result<Instance, GpuError> {
+    pub fn new(validation: bool) -> Result<Instance, GpuError> {
         let library = Library::open(LOADER_NAMES).map_err(|e| {
             GpuError::Internal(format!(
                 "{e}: install a Vulkan driver (on Linux, mesa-vulkan-drivers provides one)"
@@ -144,8 +138,6 @@ impl Instance {
                 }
             }
 
-            let validation =
-                desc.validation || std::env::var_os("SHALLOT_GPU_VALIDATION").is_some();
             let mut layers: Vec<&CStr> = Vec::new();
             if validation {
                 let available_layers = vk::enumerate(
@@ -220,7 +212,7 @@ impl Instance {
                 None
             };
             Ok(Instance {
-                shared: Arc::new(InstanceShared {
+                inner: Arc::new(InstanceInner {
                     _library: library,
                     raw,
                     fns,
@@ -234,18 +226,9 @@ impl Instance {
         }
     }
 
-    /// `navigator.gpu.requestAdapter`. Resolves to `None` when no device fits the options.
-    pub fn request_adapter(
-        &self,
-        options: &RequestAdapterOptions<'_>,
-    ) -> impl Future<Output = Option<Adapter>> {
-        let adapter = self.pick_adapter(options);
-        std::future::ready(adapter)
-    }
-
-    /// Every usable adapter, best first.
-    pub fn enumerate_adapters(&self) -> Vec<Adapter> {
-        let instance = &self.shared;
+    /// Every usable adapter, in no particular order.
+    pub fn adapters(&self) -> Vec<Adapter> {
+        let instance = &self.inner;
         let devices = unsafe {
             vk::enumerate(
                 |count, items| {
@@ -255,70 +238,43 @@ impl Instance {
             )
         }
         .unwrap_or_default();
-        let mut adapters: Vec<Adapter> = devices
+        devices
             .into_iter()
-            .filter_map(|pd| AdapterShared::probe(instance, pd))
-            .collect();
-        adapters.sort_by_key(|a| std::cmp::Reverse(a.shared.score(PowerPreference::None)));
-        adapters
+            .filter_map(|pd| Adapter::probe(instance, pd))
+            .collect()
     }
 
-    fn pick_adapter(&self, options: &RequestAdapterOptions<'_>) -> Option<Adapter> {
-        let mut candidates = self.enumerate_adapters();
-        candidates.retain(|a| {
-            if options.force_fallback_adapter && !a.shared.info.is_fallback_adapter {
-                return false;
-            }
-            match options.compatible_surface {
-                Some(surface) => surface.supported_by(&a.shared),
-                None => true,
-            }
-        });
-        candidates
-            .into_iter()
-            .max_by_key(|a| a.shared.score(options.power_preference))
-    }
-
-    /// `navigator.gpu.getPreferredCanvasFormat()`.
-    pub fn preferred_surface_format(&self) -> TextureFormat {
-        TextureFormat::Bgra8Unorm
-    }
-
-    /// Creates a surface (the `GPUCanvasContext` analogue) for a window.
-    ///
     /// # Safety
     /// The handles must stay valid until the surface is dropped.
     pub unsafe fn create_surface(&self, window: RawWindowHandle) -> Result<Surface, GpuError> {
-        Surface::new(&self.shared, window)
+        Surface::new(&self.inner, window)
     }
 }
 
 // ------------------------------------------------------------------------------------------
 // Adapter
 
-pub(crate) struct AdapterShared {
-    pub instance: Arc<InstanceShared>,
+pub(crate) struct AdapterInner {
+    pub instance: Arc<InstanceInner>,
     pub raw: vk::PhysicalDevice,
     pub properties: vk::PhysicalDeviceProperties,
     pub memory: vk::PhysicalDeviceMemoryProperties,
     pub queue_family: u32,
     pub api_version: u32,
-    pub info: AdapterInfo,
-    pub features: Vec<Feature>,
-    pub limits: Limits,
     pub vk_features: vk::PhysicalDeviceFeatures,
     pub extensions: Vec<CString>,
     pub depth24: i32,
     pub depth24_stencil8: i32,
 }
 
-unsafe impl Send for AdapterShared {}
-unsafe impl Sync for AdapterShared {}
+unsafe impl Send for AdapterInner {}
+unsafe impl Sync for AdapterInner {}
 
-/// `GPUAdapter`.
-#[derive(Clone)]
-pub struct Adapter {
-    pub(crate) shared: Arc<AdapterShared>,
+pub(crate) struct Adapter {
+    pub(crate) inner: Arc<AdapterInner>,
+    pub info: AdapterInfo,
+    pub features: Vec<Feature>,
+    pub limits: Limits,
 }
 
 // Indices into VkPhysicalDeviceFeatures.
@@ -338,8 +294,8 @@ const FEATURE_SHADER_STORAGE_IMAGE_EXTENDED_FORMATS: usize = 29;
 const FEATURE_SHADER_STORAGE_IMAGE_READ_WITHOUT_FORMAT: usize = 31;
 const FEATURE_SHADER_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: usize = 32;
 
-impl AdapterShared {
-    fn probe(instance: &Arc<InstanceShared>, raw: vk::PhysicalDevice) -> Option<Adapter> {
+impl Adapter {
+    fn probe(instance: &Arc<InstanceInner>, raw: vk::PhysicalDevice) -> Option<Adapter> {
         unsafe {
             let fns = &instance.fns;
             let mut properties: vk::PhysicalDeviceProperties = std::mem::zeroed();
@@ -484,27 +440,28 @@ impl AdapterShared {
                 ..defaults
             };
             Some(Adapter {
-                shared: Arc::new(AdapterShared {
+                inner: Arc::new(AdapterInner {
                     instance: instance.clone(),
                     raw,
                     properties,
                     memory,
                     queue_family,
                     api_version,
-                    info,
-                    features,
-                    limits,
                     vk_features,
                     extensions,
                     depth24,
                     depth24_stencil8,
                 }),
+                info,
+                features,
+                limits,
             })
         }
     }
 
-    fn score(&self, preference: PowerPreference) -> i32 {
-        let kind = self.properties.device_type;
+    /// How well the adapter suits `preference`; higher is better.
+    pub fn score(&self, preference: PowerPreference) -> i32 {
+        let kind = self.inner.properties.device_type;
         match (preference, kind) {
             (PowerPreference::LowPower, vk::PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) => 5,
             (_, vk::PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) => 4,
@@ -515,133 +472,9 @@ impl AdapterShared {
         }
     }
 
-    pub fn has_extension(&self, name: &CStr) -> bool {
-        self.extensions.iter().any(|e| e.as_c_str() == name)
-    }
-
-    pub fn vk_format(&self, format: TextureFormat) -> i32 {
-        conv::format(format, self.depth24, self.depth24_stencil8)
-    }
-}
-
-fn vendor_name(id: u32) -> &'static str {
-    match id {
-        0x1002 => "amd",
-        0x10de => "nvidia",
-        0x8086 => "intel",
-        0x13b5 => "arm",
-        0x5143 => "qualcomm",
-        0x106b => "apple",
-        0x1010 => "imgtec",
-        0x10005 => "mesa",
-        _ => "",
-    }
-}
-
-impl Adapter {
-    /// `GPUAdapter.info`.
-    pub fn info(&self) -> AdapterInfo {
-        self.shared.info.clone()
-    }
-
-    pub fn features(&self) -> Vec<Feature> {
-        self.shared.features.clone()
-    }
-
-    pub fn limits(&self) -> Limits {
-        self.shared.limits
-    }
-
-    /// `GPUAdapter.requestDevice`.
-    pub fn request_device(
-        &self,
-        desc: &DeviceDescriptor<'_>,
-    ) -> impl Future<Output = Result<Device, RequestDeviceError>> {
-        std::future::ready(Device::new(&self.shared, desc))
-    }
-}
-
-// ------------------------------------------------------------------------------------------
-// Device
-
-/// One `vkQueueSubmit` and what it keeps alive until its fence signals.
-pub(crate) struct Submission {
-    pub index: u64,
-    pub fence: vk::Fence,
-    pub command_buffer: vk::CommandBuffer,
-    pub resources: Vec<Arc<dyn std::any::Any + Send + Sync>>,
-}
-
-pub(crate) struct DeviceState {
-    pub command_pool: vk::CommandPool,
-    pub in_flight: VecDeque<Submission>,
-    /// Index the next submission gets; submission indices start at 1.
-    pub next_index: u64,
-    /// Every submission with an index at or below this has finished.
-    pub completed: u64,
-    /// `write_buffer` and `write_texture` copies, recorded at the start of the next submit.
-    pub pending_writes: Vec<command::PendingWrite>,
-    /// Futures waiting for a submission index to complete.
-    pub wakers: Vec<(u64, std::task::Waker)>,
-    pub lost: bool,
-}
-
-pub(crate) struct ErrorState {
-    scopes: Vec<(ErrorFilter, Option<GpuError>)>,
-    #[allow(clippy::type_complexity)]
-    uncaptured: Option<Box<dyn Fn(GpuError) + Send + Sync>>,
-}
-
-pub(crate) struct DeviceShared {
-    pub adapter: Arc<AdapterShared>,
-    pub raw: vk::Device,
-    pub fns: vk::DeviceFns,
-    pub rendering: vk::RenderingFns,
-    pub swapchain: Option<vk::SwapchainFns>,
-    pub queue: vk::Queue,
-    pub features: Vec<Feature>,
-    pub limits: Limits,
-    pub label: String,
-    state: Mutex<DeviceState>,
-    errors: Mutex<ErrorState>,
-}
-
-unsafe impl Send for DeviceShared {}
-unsafe impl Sync for DeviceShared {}
-
-/// `GPUDevice`.
-#[derive(Clone)]
-pub struct Device {
-    pub(crate) shared: Arc<DeviceShared>,
-}
-
-/// How [`Device::poll`] waits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollType {
-    /// Retire finished work and return.
-    Poll,
-    /// Block until all submitted work has finished.
-    Wait,
-}
-
-impl Device {
-    fn new(
-        adapter: &Arc<AdapterShared>,
-        desc: &DeviceDescriptor<'_>,
-    ) -> Result<Device, RequestDeviceError> {
-        for feature in desc.required_features {
-            if !adapter.features.contains(feature) {
-                return Err(RequestDeviceError(format!(
-                    "feature {feature:?} is not supported"
-                )));
-            }
-        }
-        let limits = desc.required_limits.unwrap_or_default();
-        if !limits_fit(&limits, &adapter.limits) {
-            return Err(RequestDeviceError(
-                "required limits exceed the adapter's".into(),
-            ));
-        }
+    /// Creates the device with one graphics and compute queue.
+    pub fn open(&self) -> Result<Device, String> {
+        let adapter = &self.inner;
         unsafe {
             let instance = &adapter.instance;
             let priority = 1.0f32;
@@ -728,16 +561,13 @@ impl Device {
             let mut raw = std::ptr::null_mut();
             let r = (instance.fns.create_device)(adapter.raw, &info, std::ptr::null(), &mut raw);
             if r != vk::SUCCESS {
-                return Err(RequestDeviceError(format!(
-                    "vkCreateDevice failed: {}",
-                    vk::result_name(r)
-                )));
+                return Err(format!("vkCreateDevice failed: {}", vk::result_name(r)));
             }
             let get = instance.fns.get_device_proc_addr;
             let load = |name: &CStr| get(raw, name.as_ptr());
             let fns = match vk::DeviceFns::load(load) {
                 Ok(fns) => fns,
-                Err(name) => return Err(RequestDeviceError(format!("device is missing {name}"))),
+                Err(name) => return Err(format!("device is missing {name}")),
             };
             // Promoted entry points: the core name, or the KHR name on Vulkan 1.1 and 1.2.
             let rendering = vk::RenderingFns::load(|name| {
@@ -752,7 +582,7 @@ impl Device {
                 Ok(r) => r,
                 Err(name) => {
                     (fns.destroy_device)(raw, std::ptr::null());
-                    return Err(RequestDeviceError(format!("device is missing {name}")));
+                    return Err(format!("device is missing {name}"));
                 }
             };
             let swapchain = if extensions.contains(&c"VK_KHR_swapchain") {
@@ -773,159 +603,95 @@ impl Device {
             let r = (fns.create_command_pool)(raw, &pool_info, std::ptr::null(), &mut command_pool);
             if r != vk::SUCCESS {
                 (fns.destroy_device)(raw, std::ptr::null());
-                return Err(RequestDeviceError(format!(
+                return Err(format!(
                     "vkCreateCommandPool failed: {}",
                     vk::result_name(r)
-                )));
+                ));
             }
-
             Ok(Device {
-                shared: Arc::new(DeviceShared {
+                inner: Arc::new(DeviceInner {
                     adapter: adapter.clone(),
                     raw,
                     fns,
                     rendering,
                     swapchain,
                     queue,
-                    features: desc.required_features.to_vec(),
-                    limits,
-                    label: desc.label.unwrap_or("").to_string(),
-                    state: Mutex::new(DeviceState {
-                        command_pool,
-                        in_flight: VecDeque::new(),
-                        next_index: 1,
-                        completed: 0,
-                        pending_writes: Vec::new(),
-                        wakers: Vec::new(),
-                        lost: false,
-                    }),
-                    errors: Mutex::new(ErrorState {
-                        scopes: Vec::new(),
-                        uncaptured: None,
-                    }),
+                    command_pool: Mutex::new(command_pool),
                 }),
             })
         }
     }
+}
 
-    pub fn features(&self) -> Vec<Feature> {
-        self.shared.features.clone()
+impl AdapterInner {
+    pub fn has_extension(&self, name: &CStr) -> bool {
+        self.extensions.iter().any(|e| e.as_c_str() == name)
     }
 
-    pub fn limits(&self) -> Limits {
-        self.shared.limits
+    pub fn vk_format(&self, format: TextureFormat) -> i32 {
+        conv::format(format, self.depth24, self.depth24_stencil8)
     }
+}
 
-    pub fn adapter_info(&self) -> AdapterInfo {
-        self.shared.adapter.info.clone()
+fn vendor_name(id: u32) -> &'static str {
+    match id {
+        0x1002 => "amd",
+        0x10de => "nvidia",
+        0x8086 => "intel",
+        0x13b5 => "arm",
+        0x5143 => "qualcomm",
+        0x106b => "apple",
+        0x1010 => "imgtec",
+        0x10005 => "mesa",
+        _ => "",
     }
+}
 
-    /// `GPUDevice.queue`.
-    pub fn queue(&self) -> Queue {
-        Queue {
-            device: self.shared.clone(),
+// ------------------------------------------------------------------------------------------
+// Device
+
+pub(crate) struct DeviceInner {
+    pub adapter: Arc<AdapterInner>,
+    pub raw: vk::Device,
+    pub fns: vk::DeviceFns,
+    pub rendering: vk::RenderingFns,
+    pub swapchain: Option<vk::SwapchainFns>,
+    pub queue: vk::Queue,
+    /// Command buffers are allocated and freed under this lock, which also serialises queue
+    /// submission.
+    pub command_pool: Mutex<vk::CommandPool>,
+}
+
+unsafe impl Send for DeviceInner {}
+unsafe impl Sync for DeviceInner {}
+
+impl Drop for DeviceInner {
+    fn drop(&mut self) {
+        unsafe {
+            (self.fns.device_wait_idle)(self.raw);
+            let pool = *self.command_pool.get_mut().unwrap();
+            (self.fns.destroy_command_pool)(self.raw, pool, std::ptr::null());
+            (self.fns.destroy_device)(self.raw, std::ptr::null());
         }
     }
+}
 
-    /// `pushErrorScope`.
-    pub fn push_error_scope(&self, filter: ErrorFilter) {
-        self.shared
-            .errors
-            .lock()
-            .unwrap()
-            .scopes
-            .push((filter, None));
-    }
+pub(crate) struct Device {
+    pub(crate) inner: Arc<DeviceInner>,
+}
 
-    /// `popErrorScope`: the first error the scope caught, if any.
-    pub fn pop_error_scope(&self) -> impl Future<Output = Option<GpuError>> {
-        let popped = self.shared.errors.lock().unwrap().scopes.pop();
-        let result = match popped {
-            Some((_, error)) => error,
-            None => {
-                self.shared.report(GpuError::Validation(
-                    "popErrorScope with no scope pushed".into(),
-                ));
-                None
-            }
-        };
-        std::future::ready(result)
-    }
-
-    /// Sets the `uncapturederror` handler. Without one, uncaptured errors are printed to stderr,
-    /// as browsers print them to the console.
-    pub fn on_uncaptured_error(&self, handler: impl Fn(GpuError) + Send + Sync + 'static) {
-        self.shared.errors.lock().unwrap().uncaptured = Some(Box::new(handler));
-    }
-
-    /// Retires finished submissions, flushing queued writes first. With [`PollType::Wait`],
-    /// blocks until everything submitted so far has finished.
-    pub fn poll(&self, kind: PollType) {
-        self.shared.flush_pending_writes();
-        let mut state = self.shared.lock();
-        let target = if kind == PollType::Wait {
-            state.next_index - 1
-        } else {
-            0
-        };
-        self.shared.wait_for(&mut state, target);
-        self.shared.retire(&mut state);
+impl Device {
+    /// Blocks until the device has finished all submitted work.
+    pub fn wait_idle(&self) {
+        unsafe { (self.inner.fns.device_wait_idle)(self.inner.raw) };
     }
 }
 
-fn limits_fit(required: &Limits, supported: &Limits) -> bool {
-    required.max_texture_dimension_2d <= supported.max_texture_dimension_2d
-        && required.max_bind_groups <= supported.max_bind_groups
-        && required.max_storage_buffers_per_shader_stage
-            <= supported.max_storage_buffers_per_shader_stage
-        && required.max_uniform_buffer_binding_size <= supported.max_uniform_buffer_binding_size
-        && required.max_storage_buffer_binding_size <= supported.max_storage_buffer_binding_size
-        && required.max_color_attachments <= supported.max_color_attachments
-        && required.max_vertex_buffers <= supported.max_vertex_buffers
-        && required.max_compute_invocations_per_workgroup
-            <= supported.max_compute_invocations_per_workgroup
-        && required.min_uniform_buffer_offset_alignment
-            >= supported.min_uniform_buffer_offset_alignment
-        && required.min_storage_buffer_offset_alignment
-            >= supported.min_storage_buffer_offset_alignment
-}
-
-impl DeviceShared {
+impl DeviceInner {
     /// Whether a `VkPhysicalDeviceFeatures` member, by index, is enabled. Every one the
     /// device creation list names is enabled when the adapter has it.
     pub fn has_feature_flag(&self, index: usize) -> bool {
         self.adapter.vk_features.flags[index] != 0
-    }
-
-    pub fn lock(&self) -> MutexGuard<'_, DeviceState> {
-        self.state.lock().unwrap()
-    }
-
-    /// Routes an error to the innermost matching error scope, or the uncaptured handler.
-    pub fn report(&self, error: GpuError) {
-        let mut errors = self.errors.lock().unwrap();
-        let filter = error.filter();
-        if let Some(scope) = errors.scopes.iter_mut().rev().find(|(f, _)| *f == filter) {
-            if scope.1.is_none() {
-                scope.1 = Some(error);
-            }
-            return;
-        }
-        match &errors.uncaptured {
-            Some(handler) => handler(error),
-            None => {
-                let label = if self.label.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", self.label)
-                };
-                eprintln!("shallot-gpu{label}: uncaptured {error}");
-            }
-        }
-    }
-
-    pub fn validation(&self, message: impl Into<String>) {
-        self.report(GpuError::Validation(message.into()));
     }
 
     /// Picks a memory type allowed by `bits` with all of `required`, preferring `preferred`.
@@ -968,84 +734,43 @@ impl DeviceShared {
         };
         Ok(memory)
     }
+}
 
-    /// Frees resources of submissions whose fences have signalled.
-    pub fn retire(&self, state: &mut DeviceState) {
-        while let Some(front) = state.in_flight.front() {
-            let status = unsafe { (self.fns.get_fence_status)(self.raw, front.fence) };
-            if status == vk::NOT_READY {
-                break;
-            }
-            if status == vk::ERROR_DEVICE_LOST {
-                state.lost = true;
-            }
-            let done = state.in_flight.pop_front().unwrap();
-            state.completed = state.completed.max(done.index);
-            self.free_submission(state.command_pool, done);
-        }
-        if state.in_flight.is_empty() {
-            state.completed = state.next_index - 1;
-        }
-        let completed = state.completed;
-        let (ready, waiting): (Vec<_>, Vec<_>) = state
-            .wakers
-            .drain(..)
-            .partition(|(index, _)| *index <= completed);
-        state.wakers = waiting;
-        for (_, waker) in ready {
-            waker.wake();
+/// One `vkQueueSubmit`: its command buffer and the fence it signals.
+pub(crate) struct Submission {
+    device: Arc<DeviceInner>,
+    fence: vk::Fence,
+    command_buffer: vk::CommandBuffer,
+}
+
+unsafe impl Send for Submission {}
+unsafe impl Sync for Submission {}
+
+impl Submission {
+    pub fn status(&self) -> hal::Status {
+        match unsafe { (self.device.fns.get_fence_status)(self.device.raw, self.fence) } {
+            vk::NOT_READY => hal::Status::Pending,
+            vk::ERROR_DEVICE_LOST => hal::Status::Lost,
+            _ => hal::Status::Done,
         }
     }
 
-    fn free_submission(&self, pool: vk::CommandPool, submission: Submission) {
-        unsafe {
-            (self.fns.destroy_fence)(self.raw, submission.fence, std::ptr::null());
-            (self.fns.free_command_buffers)(self.raw, pool, 1, &submission.command_buffer);
-        }
-        drop(submission.resources);
-    }
-
-    /// Blocks until submission `index` (and everything before it) has finished.
-    pub fn wait_for(&self, state: &mut DeviceState, index: u64) {
-        while state.completed < index {
-            let Some(front) = state.in_flight.front() else {
-                state.completed = state.next_index - 1;
-                break;
-            };
-            let r = unsafe {
-                (self.fns.wait_for_fences)(self.raw, 1, &front.fence, vk::TRUE, u64::MAX)
-            };
-            if r == vk::ERROR_DEVICE_LOST {
-                state.lost = true;
-            }
-            self.retire(state);
-        }
-    }
-
-    pub fn is_complete(&self, index: u64) -> bool {
-        let mut state = self.lock();
-        if state.completed >= index {
-            return true;
-        }
-        self.retire(&mut state);
-        state.completed >= index
+    /// Blocks until the work finishes. False if the device was lost.
+    pub fn wait(&self) -> bool {
+        let r = unsafe {
+            (self.device.fns.wait_for_fences)(self.device.raw, 1, &self.fence, vk::TRUE, u64::MAX)
+        };
+        r != vk::ERROR_DEVICE_LOST
     }
 }
 
-impl Drop for DeviceShared {
+impl Drop for Submission {
     fn drop(&mut self) {
+        let device = &self.device;
+        let pool = device.command_pool.lock().unwrap();
         unsafe {
-            (self.fns.device_wait_idle)(self.raw);
-            let state = self.state.get_mut().unwrap();
-            let pool = state.command_pool;
-            let pending: Vec<Submission> = state.in_flight.drain(..).collect();
-            let writes = std::mem::take(&mut state.pending_writes);
-            drop(writes);
-            for submission in pending {
-                self.free_submission(pool, submission);
-            }
-            (self.fns.destroy_command_pool)(self.raw, pool, std::ptr::null());
-            (self.fns.destroy_device)(self.raw, std::ptr::null());
+            (device.fns.destroy_fence)(device.raw, self.fence, std::ptr::null());
+            (device.fns.free_command_buffers)(device.raw, *pool, 1, &self.command_buffer);
         }
     }
 }
