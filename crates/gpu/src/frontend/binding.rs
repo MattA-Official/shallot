@@ -6,7 +6,8 @@
 //! read and written in one pass, for example). Finer layouts can come with finer tracking.
 
 use super::resource::{label, named, BufferShared, TextureViewShared};
-use super::{check, conv, vk, Device, DeviceShared};
+use super::{Device, DeviceShared};
+use crate::hal;
 use crate::*;
 use std::sync::Arc;
 
@@ -14,24 +15,18 @@ use std::sync::Arc;
 // Samplers
 
 pub(crate) struct SamplerShared {
-    pub device: Arc<DeviceShared>,
-    pub raw: vk::Sampler,
+    /// `None` for an invalid sampler.
+    pub raw: Option<hal::Sampler>,
     pub comparison: bool,
     /// Whether any filter is linear, which `non-filtering` sampler bindings forbid.
     pub filtering: bool,
     pub label: String,
 }
 
-unsafe impl Send for SamplerShared {}
-unsafe impl Sync for SamplerShared {}
-
-impl Drop for SamplerShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_sampler)(self.device.raw, self.raw, std::ptr::null())
-            };
-        }
+impl SamplerShared {
+    /// The backend sampler of a sampler that has passed validation.
+    pub fn hal(&self) -> &hal::Sampler {
+        self.raw.as_ref().expect("a validated sampler")
     }
 }
 
@@ -55,8 +50,7 @@ impl Device {
             }
             Sampler {
                 shared: Arc::new(SamplerShared {
-                    device: device.clone(),
-                    raw: 0,
+                    raw: None,
                     comparison: desc.compare.is_some(),
                     filtering,
                     label: name.clone(),
@@ -78,60 +72,19 @@ impl Device {
                 "anisotropic filtering needs every filter to be linear".into(),
             ));
         }
-        // Devices without anisotropy clamp to 1, which WebGPU allows ("at most").
-        let anisotropy = if device.has_feature_flag(super::FEATURE_SAMPLER_ANISOTROPY) {
-            (desc.max_anisotropy as f32)
-                .min(device.adapter.properties.limits.max_sampler_anisotropy)
-        } else {
-            1.0
-        };
-        let filter = |f: FilterMode| match f {
-            FilterMode::Nearest => vk::FILTER_NEAREST,
-            FilterMode::Linear => vk::FILTER_LINEAR,
-        };
-        let address = |a: AddressMode| match a {
-            AddressMode::ClampToEdge => vk::SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            AddressMode::Repeat => vk::SAMPLER_ADDRESS_MODE_REPEAT,
-            AddressMode::MirrorRepeat => vk::SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
-        };
-        let info = vk::SamplerCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            mag_filter: filter(desc.mag_filter),
-            min_filter: filter(desc.min_filter),
-            mipmap_mode: match desc.mipmap_filter {
-                MipmapFilterMode::Nearest => vk::SAMPLER_MIPMAP_MODE_NEAREST,
-                MipmapFilterMode::Linear => vk::SAMPLER_MIPMAP_MODE_LINEAR,
+        match device.raw.create_sampler(desc) {
+            Ok(raw) => Sampler {
+                shared: Arc::new(SamplerShared {
+                    raw: Some(raw),
+                    comparison: desc.compare.is_some(),
+                    filtering,
+                    label: name,
+                }),
             },
-            address_mode_u: address(desc.address_mode_u),
-            address_mode_v: address(desc.address_mode_v),
-            address_mode_w: address(desc.address_mode_w),
-            mip_lod_bias: 0.0,
-            anisotropy_enable: (anisotropy > 1.0) as u32,
-            max_anisotropy: anisotropy,
-            compare_enable: desc.compare.is_some() as u32,
-            compare_op: desc.compare.map_or(0, conv::compare),
-            min_lod: desc.lod_min_clamp,
-            max_lod: desc.lod_max_clamp,
-            border_color: vk::BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
-            unnormalized_coordinates: vk::FALSE,
-        };
-        let mut raw = 0;
-        let r =
-            unsafe { (device.fns.create_sampler)(device.raw, &info, std::ptr::null(), &mut raw) };
-        if let Err(e) = check(r, "vkCreateSampler") {
-            device.report(e);
-            return invalid(None);
-        }
-        Sampler {
-            shared: Arc::new(SamplerShared {
-                device: device.clone(),
-                raw,
-                comparison: desc.compare.is_some(),
-                filtering,
-                label: name,
-            }),
+            Err(e) => {
+                device.report(e);
+                invalid(None)
+            }
         }
     }
 }
@@ -140,29 +93,12 @@ impl Device {
 // Bind group layouts
 
 pub(crate) struct BindGroupLayoutShared {
-    pub device: Arc<DeviceShared>,
-    pub raw: vk::DescriptorSetLayout,
+    /// `None` for an invalid layout.
+    pub raw: Option<hal::BindGroupLayout>,
     /// Sorted by binding number, which is also the order of dynamic offsets.
     pub entries: Vec<BindGroupLayoutEntry>,
     pub label: String,
     pub valid: bool,
-}
-
-unsafe impl Send for BindGroupLayoutShared {}
-unsafe impl Sync for BindGroupLayoutShared {}
-
-impl Drop for BindGroupLayoutShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_descriptor_set_layout)(
-                    self.device.raw,
-                    self.raw,
-                    std::ptr::null(),
-                )
-            };
-        }
-    }
 }
 
 impl BindGroupLayoutShared {
@@ -271,49 +207,26 @@ impl BindGroupLayoutShared {
             return Err(v("too many dynamic buffer bindings".into()));
         }
 
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = entries
-            .iter()
-            .map(|e| vk::DescriptorSetLayoutBinding {
-                binding: e.binding,
-                descriptor_type: descriptor_type(&e.ty),
-                descriptor_count: 1,
-                stage_flags: stage_flags(e.visibility),
-                p_immutable_samplers: std::ptr::null(),
-            })
-            .collect();
-        let info = vk::DescriptorSetLayoutCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            binding_count: bindings.len() as u32,
-            p_bindings: bindings.as_ptr(),
-        };
-        let mut raw = 0;
-        unsafe {
-            check(
-                (device.fns.create_descriptor_set_layout)(
-                    device.raw,
-                    &info,
-                    std::ptr::null(),
-                    &mut raw,
-                ),
-                "vkCreateDescriptorSetLayout",
-            )
+        let raw = device
+            .raw
+            .create_bind_group_layout(&entries)
             .map_err(LayoutError::Device)?;
-        }
         Ok(Arc::new(BindGroupLayoutShared {
-            device: device.clone(),
-            raw,
+            raw: Some(raw),
             entries,
             label: name,
             valid: true,
         }))
     }
 
-    pub(crate) fn invalid(device: &Arc<DeviceShared>, name: String) -> Arc<BindGroupLayoutShared> {
+    /// The backend layout of a layout that has passed validation.
+    pub fn hal(&self) -> &hal::BindGroupLayout {
+        self.raw.as_ref().expect("a validated bind group layout")
+    }
+
+    pub(crate) fn invalid(name: String) -> Arc<BindGroupLayoutShared> {
         Arc::new(BindGroupLayoutShared {
-            device: device.clone(),
-            raw: 0,
+            raw: None,
             entries: Vec::new(),
             label: name,
             valid: false,
@@ -327,46 +240,10 @@ pub(crate) fn empty_layout(device: &Arc<DeviceShared>) -> Arc<BindGroupLayoutSha
         Ok(layout) => layout,
         Err(LayoutError::Device(e)) => {
             device.report(e);
-            BindGroupLayoutShared::invalid(device, String::new())
+            BindGroupLayoutShared::invalid(String::new())
         }
         Err(LayoutError::Validation(_)) => unreachable!("an empty layout is valid"),
     }
-}
-
-fn descriptor_type(ty: &BindingType) -> i32 {
-    match ty {
-        BindingType::Buffer {
-            ty: BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            ..
-        } => vk::DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        BindingType::Buffer {
-            ty: BufferBindingType::Uniform,
-            ..
-        } => vk::DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-        BindingType::Buffer {
-            has_dynamic_offset: false,
-            ..
-        } => vk::DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        BindingType::Buffer { .. } => vk::DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
-        BindingType::Sampler(_) => vk::DESCRIPTOR_TYPE_SAMPLER,
-        BindingType::Texture { .. } => vk::DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        BindingType::StorageTexture { .. } => vk::DESCRIPTOR_TYPE_STORAGE_IMAGE,
-    }
-}
-
-pub(crate) fn stage_flags(stages: ShaderStages) -> vk::Flags {
-    let mut flags = 0;
-    if stages.contains(ShaderStages::VERTEX) {
-        flags |= vk::SHADER_STAGE_VERTEX_BIT;
-    }
-    if stages.contains(ShaderStages::FRAGMENT) {
-        flags |= vk::SHADER_STAGE_FRAGMENT_BIT;
-    }
-    if stages.contains(ShaderStages::COMPUTE) {
-        flags |= vk::SHADER_STAGE_COMPUTE_BIT;
-    }
-    flags
 }
 
 enum LayoutError {
@@ -399,11 +276,11 @@ impl Device {
             Ok(shared) => shared,
             Err(LayoutError::Validation(message)) => {
                 device.validation(format!("{}: {message}", named("bind group layout", &name)));
-                BindGroupLayoutShared::invalid(device, name)
+                BindGroupLayoutShared::invalid(name)
             }
             Err(LayoutError::Device(e)) => {
                 device.report(e);
-                BindGroupLayoutShared::invalid(device, name)
+                BindGroupLayoutShared::invalid(name)
             }
         };
         BindGroupLayout { shared }
@@ -414,26 +291,9 @@ impl Device {
 // Pipeline layouts
 
 pub(crate) struct PipelineLayoutShared {
-    pub device: Arc<DeviceShared>,
-    pub raw: vk::PipelineLayout,
+    /// `None` if the backend failed to create it.
+    pub raw: Option<hal::PipelineLayout>,
     pub groups: Vec<Arc<BindGroupLayoutShared>>,
-}
-
-unsafe impl Send for PipelineLayoutShared {}
-unsafe impl Sync for PipelineLayoutShared {}
-
-impl Drop for PipelineLayoutShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_pipeline_layout)(
-                    self.device.raw,
-                    self.raw,
-                    std::ptr::null(),
-                )
-            };
-        }
-    }
 }
 
 impl PipelineLayoutShared {
@@ -476,28 +336,20 @@ impl PipelineLayoutShared {
         {
             return Err("too many dynamic buffer bindings across the layout".into());
         }
-        let set_layouts: Vec<vk::DescriptorSetLayout> = groups.iter().map(|g| g.raw).collect();
-        let info = vk::PipelineLayoutCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            set_layout_count: set_layouts.len() as u32,
-            p_set_layouts: set_layouts.as_ptr(),
-            push_constant_range_count: 0,
-            p_push_constant_ranges: std::ptr::null(),
+        let layouts: Vec<&hal::BindGroupLayout> = groups.iter().map(|g| g.hal()).collect();
+        let raw = match device.raw.create_pipeline_layout(&layouts) {
+            Ok(raw) => Some(raw),
+            Err(e) => {
+                device.report(e);
+                None
+            }
         };
-        let mut raw = 0;
-        let r = unsafe {
-            (device.fns.create_pipeline_layout)(device.raw, &info, std::ptr::null(), &mut raw)
-        };
-        if let Err(e) = check(r, "vkCreatePipelineLayout") {
-            device.report(e);
-        }
-        Ok(Arc::new(PipelineLayoutShared {
-            device: device.clone(),
-            raw,
-            groups,
-        }))
+        Ok(Arc::new(PipelineLayoutShared { raw, groups }))
+    }
+
+    /// The backend layout of a layout that was created.
+    pub fn hal(&self) -> &hal::PipelineLayout {
+        self.raw.as_ref().expect("a created pipeline layout")
     }
 
     /// Checks that the shader stages' bindings fit this layout, as WebGPU requires of an
@@ -621,8 +473,7 @@ impl Device {
                 ));
                 PipelineLayout {
                     shared: Arc::new(PipelineLayoutShared {
-                        device: device.clone(),
-                        raw: 0,
+                        raw: None,
                         groups: Vec::new(),
                     }),
                 }
@@ -770,7 +621,7 @@ pub(crate) fn auto_layout(
                 Err(LayoutError::Validation(message)) => Err(message),
                 Err(LayoutError::Device(e)) => {
                     device.report(e);
-                    Ok(BindGroupLayoutShared::invalid(device, String::new()))
+                    Ok(BindGroupLayoutShared::invalid(String::new()))
                 }
             },
         )
@@ -793,9 +644,8 @@ pub(crate) enum Bound {
 }
 
 pub(crate) struct BindGroupShared {
-    pub device: Arc<DeviceShared>,
-    pool: vk::DescriptorPool,
-    pub set: vk::DescriptorSet,
+    /// `None` for an invalid group.
+    pub raw: Option<hal::BindGroup>,
     pub layout: Arc<BindGroupLayoutShared>,
     /// In layout-entry order.
     pub resources: Vec<Bound>,
@@ -803,24 +653,12 @@ pub(crate) struct BindGroupShared {
     pub valid: bool,
 }
 
-unsafe impl Send for BindGroupShared {}
-unsafe impl Sync for BindGroupShared {}
-
-impl Drop for BindGroupShared {
-    fn drop(&mut self) {
-        if self.pool != 0 {
-            unsafe {
-                (self.device.fns.destroy_descriptor_pool)(
-                    self.device.raw,
-                    self.pool,
-                    std::ptr::null(),
-                )
-            };
-        }
-    }
-}
-
 impl BindGroupShared {
+    /// The backend group of a group that has passed validation.
+    pub fn hal(&self) -> &hal::BindGroup {
+        self.raw.as_ref().expect("a validated bind group")
+    }
+
     pub fn describe(&self) -> String {
         named("bind group", &self.label)
     }
@@ -877,9 +715,7 @@ impl Device {
         let name = label(desc.label);
         let invalid = || BindGroup {
             shared: Arc::new(BindGroupShared {
-                device: device.clone(),
-                pool: 0,
-                set: 0,
+                raw: None,
                 layout: desc.layout.shared.clone(),
                 resources: Vec::new(),
                 label: name.clone(),
@@ -893,12 +729,31 @@ impl Device {
                 return invalid();
             }
         };
-        match unsafe { write_descriptor_set(device, &desc.layout.shared, &resources) } {
-            Ok((pool, set)) => BindGroup {
+        let layout = &desc.layout.shared;
+        let hal_resources: Vec<hal::Resource<'_>> = resources
+            .iter()
+            .map(|r| match r {
+                Bound::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                } => hal::Resource::Buffer {
+                    buffer: buffer.hal(),
+                    offset: *offset,
+                    size: *size,
+                },
+                Bound::Sampler(sampler) => hal::Resource::Sampler(sampler.hal()),
+                Bound::Texture(view) => hal::Resource::Texture(view.hal()),
+            })
+            .collect();
+        let created = device
+            .raw
+            .create_bind_group(layout.hal(), &layout.entries, &hal_resources);
+        drop(hal_resources);
+        match created {
+            Ok(raw) => BindGroup {
                 shared: Arc::new(BindGroupShared {
-                    device: device.clone(),
-                    pool,
-                    set,
+                    raw: Some(raw),
                     layout: desc.layout.shared.clone(),
                     resources,
                     label: name,
@@ -996,7 +851,7 @@ impl Device {
                 }
                 (BindingType::Sampler(kind), BindingResource::Sampler(sampler)) => {
                     let s = &sampler.shared;
-                    if s.raw == 0 {
+                    if s.raw.is_none() {
                         return Err(format!(
                             "binding {b}: {} is invalid",
                             named("sampler", &s.label)
@@ -1107,109 +962,4 @@ fn check_view(
         ));
     }
     Ok(())
-}
-
-/// Allocates a descriptor set from a pool of its own and writes the resources into it.
-unsafe fn write_descriptor_set(
-    device: &DeviceShared,
-    layout: &BindGroupLayoutShared,
-    resources: &[Bound],
-) -> Result<(vk::DescriptorPool, vk::DescriptorSet), GpuError> {
-    let fns = &device.fns;
-    let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
-    for entry in &layout.entries {
-        let ty = descriptor_type(&entry.ty);
-        match sizes.iter_mut().find(|s| s.descriptor_type == ty) {
-            Some(size) => size.descriptor_count += 1,
-            None => sizes.push(vk::DescriptorPoolSize {
-                descriptor_type: ty,
-                descriptor_count: 1,
-            }),
-        }
-    }
-    let pool_info = vk::DescriptorPoolCreateInfo {
-        s_type: vk::STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        p_next: std::ptr::null(),
-        flags: 0,
-        max_sets: 1,
-        pool_size_count: sizes.len() as u32,
-        p_pool_sizes: sizes.as_ptr(),
-    };
-    let mut pool = 0;
-    check(
-        (fns.create_descriptor_pool)(device.raw, &pool_info, std::ptr::null(), &mut pool),
-        "vkCreateDescriptorPool",
-    )?;
-    let alloc = vk::DescriptorSetAllocateInfo {
-        s_type: vk::STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        p_next: std::ptr::null(),
-        descriptor_pool: pool,
-        descriptor_set_count: 1,
-        p_set_layouts: &layout.raw,
-    };
-    let mut set = 0;
-    if let Err(e) = check(
-        (fns.allocate_descriptor_sets)(device.raw, &alloc, &mut set),
-        "vkAllocateDescriptorSets",
-    ) {
-        (fns.destroy_descriptor_pool)(device.raw, pool, std::ptr::null());
-        return Err(e);
-    }
-
-    // Infos live in vectors sized up front so the pointers the writes hold stay valid.
-    let mut buffers = Vec::with_capacity(resources.len());
-    let mut images = Vec::with_capacity(resources.len());
-    let mut writes = Vec::with_capacity(resources.len());
-    for (entry, resource) in layout.entries.iter().zip(resources) {
-        let (p_image_info, p_buffer_info) = match resource {
-            Bound::Buffer {
-                buffer,
-                offset,
-                size,
-            } => {
-                buffers.push(vk::DescriptorBufferInfo {
-                    buffer: buffer.raw,
-                    offset: *offset,
-                    range: *size,
-                });
-                (std::ptr::null(), buffers.last().unwrap() as *const _)
-            }
-            Bound::Sampler(sampler) => {
-                images.push(vk::DescriptorImageInfo {
-                    sampler: sampler.raw,
-                    image_view: 0,
-                    image_layout: vk::IMAGE_LAYOUT_UNDEFINED,
-                });
-                (images.last().unwrap() as *const _, std::ptr::null())
-            }
-            Bound::Texture(view) => {
-                images.push(vk::DescriptorImageInfo {
-                    sampler: 0,
-                    image_view: view.raw,
-                    image_layout: vk::IMAGE_LAYOUT_GENERAL,
-                });
-                (images.last().unwrap() as *const _, std::ptr::null())
-            }
-        };
-        writes.push(vk::WriteDescriptorSet {
-            s_type: vk::STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            p_next: std::ptr::null(),
-            dst_set: set,
-            dst_binding: entry.binding,
-            dst_array_element: 0,
-            descriptor_count: 1,
-            descriptor_type: descriptor_type(&entry.ty),
-            p_image_info,
-            p_buffer_info,
-            p_texel_buffer_view: std::ptr::null(),
-        });
-    }
-    (fns.update_descriptor_sets)(
-        device.raw,
-        writes.len() as u32,
-        writes.as_ptr(),
-        0,
-        std::ptr::null(),
-    );
-    Ok((pool, set))
 }

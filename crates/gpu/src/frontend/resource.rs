@@ -4,9 +4,9 @@ use super::binding::{
     auto_layout, empty_layout, BindGroupLayout, BindGroupLayoutShared, PipelineLayoutShared,
     StageReflection,
 };
-use super::{check, conv, vk, Device, DeviceShared};
+use super::{Device, DeviceShared};
+use crate::hal;
 use crate::*;
-use std::ffi::{c_void, CString};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -53,12 +53,22 @@ pub(crate) struct BufferState {
     views: usize,
 }
 
+impl BufferState {
+    fn new() -> BufferState {
+        BufferState {
+            map: MapState::Unmapped,
+            last_use: 0,
+            destroyed: false,
+            staging: None,
+            views: 0,
+        }
+    }
+}
+
 pub(crate) struct BufferShared {
     pub device: Arc<DeviceShared>,
-    pub raw: vk::Buffer,
-    memory: vk::DeviceMemory,
-    /// Persistent mapping of host-visible memory, or null.
-    mapped: *mut u8,
+    /// `None` for an invalid buffer.
+    pub raw: Option<hal::Buffer>,
     pub size: u64,
     pub usage: BufferUsage,
     pub label: String,
@@ -66,12 +76,14 @@ pub(crate) struct BufferShared {
     pub state: Mutex<BufferState>,
 }
 
-unsafe impl Send for BufferShared {}
-unsafe impl Sync for BufferShared {}
-
 impl BufferShared {
     pub fn describe(&self) -> String {
         named("buffer", &self.label)
+    }
+
+    /// The backend buffer of a buffer that has passed validation.
+    pub fn hal(&self) -> &hal::Buffer {
+        self.raw.as_ref().expect("a validated buffer")
     }
 
     /// Creates a buffer. `host_visible` forces mappable memory (staging and map usages).
@@ -82,72 +94,16 @@ impl BufferShared {
         host_visible: bool,
         label: String,
     ) -> Result<BufferShared, GpuError> {
-        let info = vk::BufferCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            size: size.max(4),
-            usage: conv::buffer_usage(usage),
-            sharing_mode: vk::SHARING_MODE_EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
-        };
-        unsafe {
-            let mut raw = 0;
-            check(
-                (device.fns.create_buffer)(device.raw, &info, std::ptr::null(), &mut raw),
-                "vkCreateBuffer",
-            )?;
-            let mut requirements = vk::MemoryRequirements::default();
-            (device.fns.get_buffer_memory_requirements)(device.raw, raw, &mut requirements);
-            let (required, preferred) = if host_visible {
-                let cached = if usage.contains(BufferUsage::MAP_READ) {
-                    vk::MEMORY_PROPERTY_HOST_CACHED_BIT
-                } else {
-                    0
-                };
-                (
-                    vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                    cached,
-                )
-            } else {
-                (0, vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-            };
-            let memory = match device.allocate(requirements, required, preferred) {
-                Ok(m) => m,
-                Err(e) => {
-                    (device.fns.destroy_buffer)(device.raw, raw, std::ptr::null());
-                    return Err(e);
-                }
-            };
-            (device.fns.bind_buffer_memory)(device.raw, raw, memory, 0);
-            let mut mapped = std::ptr::null_mut();
-            if host_visible {
-                let mut ptr: *mut c_void = std::ptr::null_mut();
-                check(
-                    (device.fns.map_memory)(device.raw, memory, 0, vk::WHOLE_SIZE, 0, &mut ptr),
-                    "vkMapMemory",
-                )?;
-                mapped = ptr as *mut u8;
-            }
-            Ok(BufferShared {
-                device: device.clone(),
-                raw,
-                memory,
-                mapped,
-                size,
-                usage,
-                label,
-                valid: true,
-                state: Mutex::new(BufferState {
-                    map: MapState::Unmapped,
-                    last_use: 0,
-                    destroyed: false,
-                    staging: None,
-                    views: 0,
-                }),
-            })
-        }
+        let raw = device.raw.create_buffer(size, usage, host_visible)?;
+        Ok(BufferShared {
+            device: device.clone(),
+            raw: Some(raw),
+            size,
+            usage,
+            label,
+            valid: true,
+            state: Mutex::new(BufferState::new()),
+        })
     }
 
     fn invalid(
@@ -158,20 +114,12 @@ impl BufferShared {
     ) -> BufferShared {
         BufferShared {
             device: device.clone(),
-            raw: 0,
-            memory: 0,
-            mapped: std::ptr::null_mut(),
+            raw: None,
             size,
             usage,
             label,
             valid: false,
-            state: Mutex::new(BufferState {
-                map: MapState::Unmapped,
-                last_use: 0,
-                destroyed: false,
-                staging: None,
-                views: 0,
-            }),
+            state: Mutex::new(BufferState::new()),
         }
     }
 
@@ -184,7 +132,7 @@ impl BufferShared {
             true,
             "staging".into(),
         )?;
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped, data.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.hal().mapped(), data.len()) };
         Ok(Arc::new(buffer))
     }
 
@@ -201,17 +149,6 @@ impl BufferShared {
             return Err(format!("{} is mapped or pending map", self.describe()));
         }
         Ok(())
-    }
-}
-
-impl Drop for BufferShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_buffer)(self.device.raw, self.raw, std::ptr::null());
-                (self.device.fns.free_memory)(self.device.raw, self.memory, std::ptr::null());
-            }
-        }
     }
 }
 
@@ -426,9 +363,10 @@ impl Buffer {
             "{} is mapped for reading only",
             shared.describe()
         );
-        let base = match &state.staging {
-            Some(staging) => staging.mapped,
-            None => shared.mapped,
+        let base = match (&state.staging, &shared.raw) {
+            (Some(staging), _) => staging.hal().mapped(),
+            (None, Some(raw)) => raw.mapped(),
+            (None, None) => std::ptr::null_mut(),
         };
         assert!(!base.is_null(), "{} has no mapping", shared.describe());
         state.views += 1;
@@ -561,10 +499,8 @@ impl Drop for BufferViewMut<'_> {
 
 pub(crate) struct TextureShared {
     pub device: Arc<DeviceShared>,
-    pub raw: vk::Image,
-    /// Zero for swapchain images, which the swapchain owns.
-    memory: vk::DeviceMemory,
-    owned: bool,
+    /// `None` for an invalid texture.
+    pub raw: Option<hal::Texture>,
     pub size: Extent3d,
     pub format: TextureFormat,
     pub usage: TextureUsage,
@@ -574,34 +510,22 @@ pub(crate) struct TextureShared {
     pub label: String,
     pub valid: bool,
     pub destroyed: Mutex<bool>,
-    /// Current layout of every subresource; transitions are whole-texture for now.
-    pub layout: Mutex<i32>,
-    /// For swapchain images: the semaphore the first submission using the image must wait on.
-    pub acquire: Mutex<Option<vk::Semaphore>>,
 }
-
-unsafe impl Send for TextureShared {}
-unsafe impl Sync for TextureShared {}
 
 impl TextureShared {
     pub fn describe(&self) -> String {
         named("texture", &self.label)
     }
 
+    /// The backend texture of a texture that has passed validation.
+    pub fn hal(&self) -> &hal::Texture {
+        self.raw.as_ref().expect("a validated texture")
+    }
+
     pub fn array_layers(&self) -> u32 {
         match self.dimension {
             TextureDimension::D3 => 1,
             _ => self.size.depth_or_array_layers,
-        }
-    }
-
-    pub fn full_range(&self) -> vk::ImageSubresourceRange {
-        vk::ImageSubresourceRange {
-            aspect_mask: conv::aspect_mask(self.format, TextureAspect::All),
-            base_mip_level: 0,
-            level_count: self.mip_level_count,
-            base_array_layer: 0,
-            layer_count: self.array_layers(),
         }
     }
 
@@ -616,23 +540,18 @@ impl TextureShared {
     }
 
     /// Wraps a swapchain image.
-    #[allow(clippy::too_many_arguments)]
     pub fn swapchain_image(
         device: &Arc<DeviceShared>,
-        raw: vk::Image,
-        format: TextureFormat,
+        raw: hal::Texture,
         usage: TextureUsage,
         width: u32,
         height: u32,
-        acquire: vk::Semaphore,
     ) -> TextureShared {
         TextureShared {
             device: device.clone(),
-            raw,
-            memory: 0,
-            owned: false,
+            format: raw.format,
+            raw: Some(raw),
             size: Extent3d::new(width, height, 1),
-            format,
             usage,
             dimension: TextureDimension::D2,
             mip_level_count: 1,
@@ -640,19 +559,6 @@ impl TextureShared {
             label: "surface texture".into(),
             valid: true,
             destroyed: Mutex::new(false),
-            layout: Mutex::new(vk::IMAGE_LAYOUT_UNDEFINED),
-            acquire: Mutex::new(Some(acquire)),
-        }
-    }
-}
-
-impl Drop for TextureShared {
-    fn drop(&mut self) {
-        if self.owned && self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_image)(self.device.raw, self.raw, std::ptr::null());
-                (self.device.fns.free_memory)(self.device.raw, self.memory, std::ptr::null());
-            }
         }
     }
 }
@@ -670,9 +576,7 @@ impl Device {
         let name = label(desc.label);
         let invalid = |name: String| TextureShared {
             device: device.clone(),
-            raw: 0,
-            memory: 0,
-            owned: false,
+            raw: None,
             size: desc.size,
             format: desc.format,
             usage: desc.usage,
@@ -682,8 +586,6 @@ impl Device {
             label: name,
             valid: false,
             destroyed: Mutex::new(false),
-            layout: Mutex::new(vk::IMAGE_LAYOUT_UNDEFINED),
-            acquire: Mutex::new(None),
         };
         let size = desc.size;
         let limits = &device.limits;
@@ -752,77 +654,12 @@ impl Device {
             };
         }
 
-        let vk_format = device.adapter.vk_format(desc.format);
-        let array_layers = if desc.dimension == TextureDimension::D3 {
-            1
-        } else {
-            size.depth_or_array_layers
-        };
-        let depth = if desc.dimension == TextureDimension::D3 {
-            size.depth_or_array_layers
-        } else {
-            1
-        };
-        let cube_compatible = desc.dimension == TextureDimension::D2
-            && array_layers >= 6
-            && size.width == size.height;
-        let info = vk::ImageCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: if cube_compatible {
-                vk::IMAGE_CREATE_CUBE_COMPATIBLE_BIT
-            } else {
-                0
-            },
-            image_type: match desc.dimension {
-                TextureDimension::D1 => vk::IMAGE_TYPE_1D,
-                TextureDimension::D2 => vk::IMAGE_TYPE_2D,
-                TextureDimension::D3 => vk::IMAGE_TYPE_3D,
-            },
-            format: vk_format,
-            extent: vk::Extent3D {
-                width: size.width,
-                height: size.height,
-                depth,
-            },
-            mip_levels: desc.mip_level_count,
-            array_layers,
-            samples: desc.sample_count,
-            tiling: vk::IMAGE_TILING_OPTIMAL,
-            usage: conv::texture_usage(desc.usage, desc.format),
-            sharing_mode: vk::SHARING_MODE_EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
-            initial_layout: vk::IMAGE_LAYOUT_UNDEFINED,
-        };
-        let result = unsafe {
-            let mut raw = 0;
-            check(
-                (device.fns.create_image)(device.raw, &info, std::ptr::null(), &mut raw),
-                "vkCreateImage",
-            )
-            .and_then(|_| {
-                let mut requirements = vk::MemoryRequirements::default();
-                (device.fns.get_image_memory_requirements)(device.raw, raw, &mut requirements);
-                match device.allocate(requirements, 0, vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-                    Ok(memory) => {
-                        (device.fns.bind_image_memory)(device.raw, raw, memory, 0);
-                        Ok((raw, memory))
-                    }
-                    Err(e) => {
-                        (device.fns.destroy_image)(device.raw, raw, std::ptr::null());
-                        Err(e)
-                    }
-                }
-            })
-        };
+        let result = device.raw.create_texture(desc);
         match result {
-            Ok((raw, memory)) => Texture {
+            Ok(raw) => Texture {
                 shared: Arc::new(TextureShared {
                     device: device.clone(),
-                    raw,
-                    memory,
-                    owned: true,
+                    raw: Some(raw),
                     size,
                     format: desc.format,
                     usage: desc.usage,
@@ -832,8 +669,6 @@ impl Device {
                     label: name,
                     valid: true,
                     destroyed: Mutex::new(false),
-                    layout: Mutex::new(vk::IMAGE_LAYOUT_UNDEFINED),
-                    acquire: Mutex::new(None),
                 }),
             },
             Err(e) => {
@@ -941,7 +776,7 @@ impl Texture {
             };
             (!ok).then(|| format!("{dimension:?} views are not allowed for this texture"))
         };
-        let view = |raw: vk::ImageView, valid: bool| TextureView {
+        let view = |raw: Option<hal::TextureView>, valid: bool| TextureView {
             shared: Arc::new(TextureViewShared {
                 texture: texture.clone(),
                 raw,
@@ -958,40 +793,22 @@ impl Texture {
         };
         if let Some(message) = error {
             device.validation(format!("{}: {message}", named("texture view", &name)));
-            return view(0, false);
+            return view(None, false);
         }
-        let info = vk::ImageViewCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            image: texture.raw,
-            view_type: match dimension {
-                TextureViewDimension::D1 => vk::IMAGE_VIEW_TYPE_1D,
-                TextureViewDimension::D2 => vk::IMAGE_VIEW_TYPE_2D,
-                TextureViewDimension::D2Array => vk::IMAGE_VIEW_TYPE_2D_ARRAY,
-                TextureViewDimension::Cube => vk::IMAGE_VIEW_TYPE_CUBE,
-                TextureViewDimension::CubeArray => vk::IMAGE_VIEW_TYPE_CUBE_ARRAY,
-                TextureViewDimension::D3 => vk::IMAGE_VIEW_TYPE_3D,
-            },
-            format: device.adapter.vk_format(format),
-            components: vk::ComponentMapping::default(),
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: conv::aspect_mask(format, desc.aspect),
-                base_mip_level: desc.base_mip_level,
-                level_count: mip_level_count,
-                base_array_layer: desc.base_array_layer,
-                layer_count: array_layer_count,
-            },
+        let range = hal::ViewDesc {
+            format,
+            dimension,
+            aspect: desc.aspect,
+            base_mip_level: desc.base_mip_level,
+            mip_level_count,
+            base_array_layer: desc.base_array_layer,
+            array_layer_count,
         };
-        let mut raw = 0;
-        let r = unsafe {
-            (device.fns.create_image_view)(device.raw, &info, std::ptr::null(), &mut raw)
-        };
-        match check(r, "vkCreateImageView") {
-            Ok(()) => view(raw, true),
+        match device.raw.create_view(texture.hal(), &range) {
+            Ok(raw) => view(Some(raw), true),
             Err(e) => {
                 device.report(e);
-                view(0, false)
+                view(None, false)
             }
         }
     }
@@ -1011,7 +828,8 @@ fn format_compatible(a: TextureFormat, b: TextureFormat) -> bool {
 
 pub(crate) struct TextureViewShared {
     pub texture: Arc<TextureShared>,
-    pub raw: vk::ImageView,
+    /// `None` for an invalid view.
+    pub raw: Option<hal::TextureView>,
     pub format: TextureFormat,
     pub dimension: TextureViewDimension,
     pub aspect: TextureAspect,
@@ -1025,10 +843,12 @@ pub(crate) struct TextureViewShared {
     pub valid: bool,
 }
 
-unsafe impl Send for TextureViewShared {}
-unsafe impl Sync for TextureViewShared {}
-
 impl TextureViewShared {
+    /// The backend view of a view that has passed validation.
+    pub fn hal(&self) -> &hal::TextureView {
+        self.raw.as_ref().expect("a validated texture view")
+    }
+
     /// Width and height of the view's base mip level.
     pub fn extent(&self) -> (u32, u32) {
         let size = self.texture.size;
@@ -1040,15 +860,6 @@ impl TextureViewShared {
 
     pub fn describe(&self) -> String {
         named("texture view", &self.label)
-    }
-}
-
-impl Drop for TextureViewShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            let device = &self.texture.device;
-            unsafe { (device.fns.destroy_image_view)(device.raw, self.raw, std::ptr::null()) };
-        }
     }
 }
 
@@ -1074,22 +885,16 @@ impl TextureView {
 // Shader modules
 
 pub(crate) struct ShaderModuleShared {
-    pub device: Arc<DeviceShared>,
     pub module: Option<shallot_wgsl::Module>,
-    pub raw: vk::ShaderModule,
+    /// `None` when compilation failed.
+    pub raw: Option<hal::ShaderModule>,
     pub messages: Vec<CompilationMessage>,
 }
 
-unsafe impl Send for ShaderModuleShared {}
-unsafe impl Sync for ShaderModuleShared {}
-
-impl Drop for ShaderModuleShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_shader_module)(self.device.raw, self.raw, std::ptr::null())
-            };
-        }
+impl ShaderModuleShared {
+    /// The backend module of a module that compiled.
+    pub fn hal(&self) -> &hal::ShaderModule {
+        self.raw.as_ref().expect("a compiled shader module")
     }
 }
 
@@ -1121,9 +926,8 @@ impl Device {
             device.validation(format!("{}: {summary}", named("shader module", &name)));
             ShaderModule {
                 shared: Arc::new(ShaderModuleShared {
-                    device: device.clone(),
                     module: None,
-                    raw: 0,
+                    raw: None,
                     messages,
                 }),
             }
@@ -1144,9 +948,15 @@ impl Device {
                 return fail(vec![message], e.render(source));
             }
         };
-        let words = match module.to_spirv(&shallot_wgsl::SpirvOptions::default()) {
-            Ok(w) => w,
-            Err(e) => {
+        match device.raw.create_shader_module(&module) {
+            Ok(Ok(raw)) => ShaderModule {
+                shared: Arc::new(ShaderModuleShared {
+                    module: Some(module),
+                    raw: Some(raw),
+                    messages: Vec::new(),
+                }),
+            },
+            Ok(Err(e)) => {
                 let message = CompilationMessage {
                     message: e.message.clone(),
                     kind: CompilationMessageType::Error,
@@ -1155,31 +965,18 @@ impl Device {
                     offset: 0,
                     length: 0,
                 };
-                return fail(vec![message], e.message);
+                fail(vec![message], e.message)
             }
-        };
-        let info = vk::ShaderModuleCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            code_size: words.len() * 4,
-            p_code: words.as_ptr(),
-        };
-        let mut raw = 0;
-        let r = unsafe {
-            (device.fns.create_shader_module)(device.raw, &info, std::ptr::null(), &mut raw)
-        };
-        if let Err(e) = check(r, "vkCreateShaderModule") {
-            device.report(e);
-            raw = 0;
-        }
-        ShaderModule {
-            shared: Arc::new(ShaderModuleShared {
-                device: device.clone(),
-                module: if raw != 0 { Some(module) } else { None },
-                raw,
-                messages: Vec::new(),
-            }),
+            Err(e) => {
+                device.report(e);
+                ShaderModule {
+                    shared: Arc::new(ShaderModuleShared {
+                        module: None,
+                        raw: None,
+                        messages: Vec::new(),
+                    }),
+                }
+            }
         }
     }
 }
@@ -1189,7 +986,8 @@ impl Device {
 
 pub(crate) struct RenderPipelineShared {
     pub device: Arc<DeviceShared>,
-    pub raw: vk::Pipeline,
+    /// `None` for an invalid pipeline.
+    pub raw: Option<hal::RenderPipeline>,
     pub layout: Option<Arc<PipelineLayoutShared>>,
     pub color_formats: Vec<Option<TextureFormat>>,
     pub depth_stencil_format: Option<TextureFormat>,
@@ -1200,20 +998,12 @@ pub(crate) struct RenderPipelineShared {
     pub valid: bool,
 }
 
-unsafe impl Send for RenderPipelineShared {}
-unsafe impl Sync for RenderPipelineShared {}
-
-impl Drop for RenderPipelineShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_pipeline)(self.device.raw, self.raw, std::ptr::null())
-            };
-        }
-    }
-}
-
 impl RenderPipelineShared {
+    /// The backend pipeline of a pipeline that has passed validation.
+    pub fn hal(&self) -> &hal::RenderPipeline {
+        self.raw.as_ref().expect("a validated render pipeline")
+    }
+
     pub fn describe(&self) -> String {
         named("render pipeline", &self.label)
     }
@@ -1264,7 +1054,7 @@ impl Device {
             RenderPipeline {
                 shared: Arc::new(RenderPipelineShared {
                     device: device.clone(),
-                    raw: 0,
+                    raw: None,
                     layout: None,
                     color_formats: Vec::new(),
                     depth_stencil_format: None,
@@ -1333,8 +1123,7 @@ impl Device {
         let layout = pipeline_layout(device, &desc.layout, &reflections)?;
 
         // Vertex inputs.
-        let mut bindings = Vec::new();
-        let mut attributes = Vec::new();
+        let mut locations: Vec<u32> = Vec::new();
         if desc.vertex.buffers.len() as u32 > device.limits.max_vertex_buffers {
             return Err(v("too many vertex buffers".into()));
         }
@@ -1346,14 +1135,6 @@ impl Device {
                     "vertex buffer {slot} has an invalid arrayStride"
                 )));
             }
-            bindings.push(vk::VertexInputBindingDescription {
-                binding: slot as u32,
-                stride: layout.array_stride as u32,
-                input_rate: match layout.step_mode {
-                    VertexStepMode::Vertex => vk::VERTEX_INPUT_RATE_VERTEX,
-                    VertexStepMode::Instance => vk::VERTEX_INPUT_RATE_INSTANCE,
-                },
-            });
             for attribute in layout.attributes {
                 if layout.array_stride != 0
                     && attribute.offset + attribute.format.size() > layout.array_stride
@@ -1363,28 +1144,18 @@ impl Device {
                         attribute.shader_location
                     )));
                 }
-                if attributes
-                    .iter()
-                    .any(|a: &vk::VertexInputAttributeDescription| {
-                        a.location == attribute.shader_location
-                    })
-                {
+                if locations.contains(&attribute.shader_location) {
                     return Err(v(format!(
                         "vertex attribute location {} is used twice",
                         attribute.shader_location
                     )));
                 }
-                attributes.push(vk::VertexInputAttributeDescription {
-                    location: attribute.shader_location,
-                    binding: slot as u32,
-                    format: conv::vertex_format(attribute.format),
-                    offset: attribute.offset as u32,
-                });
+                locations.push(attribute.shader_location);
             }
         }
         for input in &vertex_entry.inputs {
             if let shallot_wgsl::ir::IoBinding::Location { location, .. } = input.io {
-                if !attributes.iter().any(|a| a.location == location) {
+                if !locations.contains(&location) {
                     return Err(v(format!(
                         "the vertex shader reads @location({location}) but no buffer provides it"
                     )));
@@ -1399,13 +1170,9 @@ impl Device {
             return Err(v("too many colour targets".into()));
         }
         let mut color_formats = Vec::new();
-        let mut vk_color_formats = Vec::new();
-        let mut blends = Vec::new();
         for (i, target) in targets.iter().enumerate() {
             let Some(target) = target else {
                 color_formats.push(None);
-                vk_color_formats.push(vk::FORMAT_UNDEFINED);
-                blends.push(vk::PipelineColorBlendAttachmentState::default());
                 continue;
             };
             if target.format.is_depth_stencil() {
@@ -1422,18 +1189,6 @@ impl Device {
                 )));
             }
             color_formats.push(Some(target.format));
-            vk_color_formats.push(device.adapter.vk_format(target.format));
-            let blend = target.blend.unwrap_or_default();
-            blends.push(vk::PipelineColorBlendAttachmentState {
-                blend_enable: target.blend.is_some() as u32,
-                src_color_blend_factor: conv::blend_factor(blend.color.src_factor),
-                dst_color_blend_factor: conv::blend_factor(blend.color.dst_factor),
-                color_blend_op: conv::blend_op(blend.color.operation),
-                src_alpha_blend_factor: conv::blend_factor(blend.alpha.src_factor),
-                dst_alpha_blend_factor: conv::blend_factor(blend.alpha.dst_factor),
-                alpha_blend_op: conv::blend_op(blend.alpha.operation),
-                color_write_mask: target.write_mask.0,
-            });
         }
         if let Some(ds) = &desc.depth_stencil {
             if !ds.format.is_depth_stencil() {
@@ -1466,205 +1221,40 @@ impl Device {
             ));
         }
 
-        // Vulkan structures.
-        let entry_names: Vec<CString> = std::iter::once(&vertex_entry.name)
-            .chain(fragment.as_ref().map(|(_, _, e)| &e.name))
-            .map(|n| CString::new(n.as_str()).unwrap())
-            .collect();
-        let mut stages = vec![vk::PipelineShaderStageCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            stage: vk::SHADER_STAGE_VERTEX_BIT,
-            module: vertex_module.raw,
-            p_name: entry_names[0].as_ptr(),
-            p_specialization_info: std::ptr::null(),
-        }];
-        if let Some((f, _, _)) = &fragment {
-            stages.push(vk::PipelineShaderStageCreateInfo {
-                s_type: vk::STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::SHADER_STAGE_FRAGMENT_BIT,
-                module: f.module.shared.raw,
-                p_name: entry_names[1].as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            });
-        }
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            vertex_binding_description_count: bindings.len() as u32,
-            p_vertex_binding_descriptions: bindings.as_ptr(),
-            vertex_attribute_description_count: attributes.len() as u32,
-            p_vertex_attribute_descriptions: attributes.as_ptr(),
+        let groups: Vec<&[BindGroupLayoutEntry]> =
+            layout.groups.iter().map(|g| g.entries.as_slice()).collect();
+        let Some(hal_layout) = layout.raw.as_ref() else {
+            return Err(v("the pipeline layout is invalid".into()));
         };
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            topology: conv::topology(desc.primitive.topology),
-            primitive_restart_enable: (strip && desc.primitive.strip_index_format.is_some()) as u32,
-        };
-        let viewport = vk::PipelineViewportStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            viewport_count: 1,
-            p_viewports: std::ptr::null(),
-            scissor_count: 1,
-            p_scissors: std::ptr::null(),
-        };
-        let depth_bias = desc
-            .depth_stencil
-            .map(|d| (d.depth_bias, d.depth_bias_slope_scale, d.depth_bias_clamp));
-        let (bias, slope, clamp) = depth_bias.unwrap_or((0, 0.0, 0.0));
-        let rasterization = vk::PipelineRasterizationStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            depth_clamp_enable: vk::FALSE,
-            rasterizer_discard_enable: vk::FALSE,
-            polygon_mode: vk::POLYGON_MODE_FILL,
-            cull_mode: match desc.primitive.cull_mode {
-                CullMode::None => vk::CULL_MODE_NONE,
-                CullMode::Front => vk::CULL_MODE_FRONT_BIT,
-                CullMode::Back => vk::CULL_MODE_BACK_BIT,
-            },
-            // The flipped viewport keeps WebGPU's winding, so this maps directly.
-            front_face: match desc.primitive.front_face {
-                FrontFace::Ccw => vk::FRONT_FACE_COUNTER_CLOCKWISE,
-                FrontFace::Cw => vk::FRONT_FACE_CLOCKWISE,
-            },
-            depth_bias_enable: (bias != 0 || slope != 0.0) as u32,
-            depth_bias_constant_factor: bias as f32,
-            depth_bias_clamp: clamp,
-            depth_bias_slope_factor: slope,
-            line_width: 1.0,
-        };
-        let sample_mask = desc.multisample.mask;
-        let multisample = vk::PipelineMultisampleStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            rasterization_samples: desc.multisample.count,
-            sample_shading_enable: vk::FALSE,
-            min_sample_shading: 0.0,
-            p_sample_mask: &sample_mask,
-            alpha_to_coverage_enable: desc.multisample.alpha_to_coverage_enabled as u32,
-            alpha_to_one_enable: vk::FALSE,
-        };
-        let depth_stencil = desc
-            .depth_stencil
-            .map(|ds| vk::PipelineDepthStencilStateCreateInfo {
-                s_type: vk::STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                depth_test_enable: ds.format.has_depth() as u32,
-                depth_write_enable: ds.depth_write_enabled as u32,
-                depth_compare_op: conv::compare(ds.depth_compare),
-                depth_bounds_test_enable: vk::FALSE,
-                stencil_test_enable: ds.format.has_stencil() as u32,
-                front: conv::stencil_face(
-                    &ds.stencil_front,
-                    ds.stencil_read_mask,
-                    ds.stencil_write_mask,
-                ),
-                back: conv::stencil_face(
-                    &ds.stencil_back,
-                    ds.stencil_read_mask,
-                    ds.stencil_write_mask,
-                ),
-                min_depth_bounds: 0.0,
-                max_depth_bounds: 1.0,
-            });
-        let color_blend = vk::PipelineColorBlendStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            logic_op_enable: vk::FALSE,
-            logic_op: 0,
-            attachment_count: blends.len() as u32,
-            p_attachments: blends.as_ptr(),
-            blend_constants: [0.0; 4],
-        };
-        let dynamic_states = [
-            vk::DYNAMIC_STATE_VIEWPORT,
-            vk::DYNAMIC_STATE_SCISSOR,
-            vk::DYNAMIC_STATE_BLEND_CONSTANTS,
-            vk::DYNAMIC_STATE_STENCIL_REFERENCE,
-        ];
-        let dynamic = vk::PipelineDynamicStateCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            dynamic_state_count: dynamic_states.len() as u32,
-            p_dynamic_states: dynamic_states.as_ptr(),
-        };
-        let ds_format = desc.depth_stencil.map(|d| d.format);
-        let vk_ds_format = ds_format
-            .map(|f| device.adapter.vk_format(f))
-            .unwrap_or(vk::FORMAT_UNDEFINED);
-        let rendering = vk::PipelineRenderingCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-            p_next: std::ptr::null(),
-            view_mask: 0,
-            color_attachment_count: vk_color_formats.len() as u32,
-            p_color_attachment_formats: vk_color_formats.as_ptr(),
-            depth_attachment_format: if ds_format.is_some_and(|f| f.has_depth()) {
-                vk_ds_format
-            } else {
-                vk::FORMAT_UNDEFINED
-            },
-            stencil_attachment_format: if ds_format.is_some_and(|f| f.has_stencil()) {
-                vk_ds_format
-            } else {
-                vk::FORMAT_UNDEFINED
-            },
-        };
-        let info = vk::GraphicsPipelineCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-            p_next: &rendering as *const _ as *const c_void,
-            flags: 0,
-            stage_count: stages.len() as u32,
-            p_stages: stages.as_ptr(),
-            p_vertex_input_state: &vertex_input,
-            p_input_assembly_state: &input_assembly,
-            p_tessellation_state: std::ptr::null(),
-            p_viewport_state: &viewport,
-            p_rasterization_state: &rasterization,
-            p_multisample_state: &multisample,
-            p_depth_stencil_state: depth_stencil
-                .as_ref()
-                .map_or(std::ptr::null(), |d| d as *const _),
-            p_color_blend_state: &color_blend,
-            p_dynamic_state: &dynamic,
-            layout: layout.raw,
-            render_pass: 0,
-            subpass: 0,
-            base_pipeline_handle: 0,
-            base_pipeline_index: -1,
-        };
-        let mut raw = 0;
-        let r = unsafe {
-            (device.fns.create_graphics_pipelines)(
-                device.raw,
-                0,
-                1,
-                &info,
-                std::ptr::null(),
-                &mut raw,
-            )
-        };
-        check(r, "vkCreateGraphicsPipelines").map_err(PipelineError::Device)?;
+        let raw = device
+            .raw
+            .create_render_pipeline(&hal::RenderPipelineDesc {
+                layout: hal_layout,
+                groups: &groups,
+                vertex: hal::Stage {
+                    module: vertex_module.hal(),
+                    reflection: vertex_reflection,
+                    entry: vertex_entry,
+                },
+                buffers: desc.vertex.buffers,
+                fragment: fragment.as_ref().map(|(f, reflection, entry)| hal::Stage {
+                    module: f.module.shared.hal(),
+                    reflection,
+                    entry,
+                }),
+                targets,
+                primitive: desc.primitive,
+                depth_stencil: desc.depth_stencil,
+                multisample: desc.multisample,
+            })
+            .map_err(PipelineError::Device)?;
         Ok(RenderPipeline {
             shared: Arc::new(RenderPipelineShared {
                 device: device.clone(),
-                raw,
+                raw: Some(raw),
                 layout: Some(layout),
                 color_formats,
-                depth_stencil_format: ds_format,
+                depth_stencil_format: desc.depth_stencil.map(|d| d.format),
                 sample_count: desc.multisample.count,
                 vertex_buffers: desc.vertex.buffers.len() as u32,
                 label: name.to_string(),
@@ -1690,7 +1280,7 @@ fn pipeline_layout(
     match choice {
         PipelineLayoutChoice::Layout(layout) => {
             let layout = &layout.shared;
-            if layout.raw == 0 {
+            if layout.raw.is_none() {
                 return Err(v("the pipeline layout is invalid".into()));
             }
             layout.check_stages(stages).map_err(v)?;
@@ -1720,7 +1310,7 @@ fn bind_group_layout(
     }
     device.validation(format!("{what}: no bind group layout at index {index}"));
     BindGroupLayout {
-        shared: BindGroupLayoutShared::invalid(device, String::new()),
+        shared: BindGroupLayoutShared::invalid(String::new()),
     }
 }
 
@@ -1734,26 +1324,19 @@ impl RenderPipeline {
 
 pub(crate) struct ComputePipelineShared {
     pub device: Arc<DeviceShared>,
-    pub raw: vk::Pipeline,
+    /// `None` for an invalid pipeline.
+    pub raw: Option<hal::ComputePipeline>,
     pub layout: Option<Arc<PipelineLayoutShared>>,
     pub label: String,
     pub valid: bool,
 }
 
-unsafe impl Send for ComputePipelineShared {}
-unsafe impl Sync for ComputePipelineShared {}
-
-impl Drop for ComputePipelineShared {
-    fn drop(&mut self) {
-        if self.raw != 0 {
-            unsafe {
-                (self.device.fns.destroy_pipeline)(self.device.raw, self.raw, std::ptr::null())
-            };
-        }
-    }
-}
-
 impl ComputePipelineShared {
+    /// The backend pipeline of a pipeline that has passed validation.
+    pub fn hal(&self) -> &hal::ComputePipeline {
+        self.raw.as_ref().expect("a validated compute pipeline")
+    }
+
     pub fn describe(&self) -> String {
         named("compute pipeline", &self.label)
     }
@@ -1782,7 +1365,7 @@ impl Device {
             Ok((raw, layout)) => ComputePipeline {
                 shared: Arc::new(ComputePipelineShared {
                     device: device.clone(),
-                    raw,
+                    raw: Some(raw),
                     layout: Some(layout),
                     label: name,
                     valid: true,
@@ -1797,7 +1380,7 @@ impl Device {
                 ComputePipeline {
                     shared: Arc::new(ComputePipelineShared {
                         device: device.clone(),
-                        raw: 0,
+                        raw: None,
                         layout: None,
                         label: name,
                         valid: false,
@@ -1810,7 +1393,7 @@ impl Device {
     fn compute_pipeline(
         &self,
         desc: &ComputePipelineDescriptor<'_>,
-    ) -> Result<(vk::Pipeline, Arc<PipelineLayoutShared>), PipelineError> {
+    ) -> Result<(hal::ComputePipeline, Arc<PipelineLayoutShared>), PipelineError> {
         let device = &self.shared;
         let v = PipelineError::Validation;
         let module = &desc.compute.module.shared;
@@ -1840,36 +1423,23 @@ impl Device {
             stage: ShaderStages::COMPUTE,
         }];
         let layout = pipeline_layout(device, &desc.layout, &stages)?;
-        let entry_name = CString::new(entry.name.as_str()).unwrap();
-        let info = vk::ComputePipelineCreateInfo {
-            s_type: vk::STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            stage: vk::PipelineShaderStageCreateInfo {
-                s_type: vk::STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::SHADER_STAGE_COMPUTE_BIT,
-                module: module.raw,
-                p_name: entry_name.as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            },
-            layout: layout.raw,
-            base_pipeline_handle: 0,
-            base_pipeline_index: -1,
+        let groups: Vec<&[BindGroupLayoutEntry]> =
+            layout.groups.iter().map(|g| g.entries.as_slice()).collect();
+        let Some(hal_layout) = layout.raw.as_ref() else {
+            return Err(v("the pipeline layout is invalid".into()));
         };
-        let mut raw = 0;
-        let r = unsafe {
-            (device.fns.create_compute_pipelines)(
-                device.raw,
-                0,
-                1,
-                &info,
-                std::ptr::null(),
-                &mut raw,
-            )
-        };
-        check(r, "vkCreateComputePipelines").map_err(PipelineError::Device)?;
+        let raw = device
+            .raw
+            .create_compute_pipeline(&hal::ComputePipelineDesc {
+                layout: hal_layout,
+                groups: &groups,
+                stage: hal::Stage {
+                    module: module.hal(),
+                    reflection,
+                    entry,
+                },
+            })
+            .map_err(PipelineError::Device)?;
         Ok((raw, layout))
     }
 }
