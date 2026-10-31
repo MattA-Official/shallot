@@ -753,7 +753,14 @@ impl<'m> Writer<'m> {
             .collect::<Result<_>>()?;
         let fn_type = self.function_type(ret, &param_types);
         let id = self.function_ids[index];
-        self.name(id, &function.name);
+        // An entry point's body is called by a wrapper that carries the WGSL name. Naming both
+        // alike makes SPIRV-Cross (MoltenVK) emit two MSL functions of the same name and
+        // parameters, which Metal rejects.
+        if self.module.entry_points.iter().any(|e| e.function == index) {
+            self.name(id, &format!("{}_body", function.name));
+        } else {
+            self.name(id, &function.name);
+        }
         self.current_fn = index;
 
         let mut head = Vec::new();
