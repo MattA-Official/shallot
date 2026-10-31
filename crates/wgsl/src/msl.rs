@@ -638,7 +638,7 @@ impl<'m> Writer<'m> {
                 otherwise,
             } => {
                 let cond = self.expr(cond)?;
-                self.line(out, &format!("if ({cond}) {{"));
+                self.line(out, &format!("if ({}) {{", unwrap_parens(&cond)));
                 self.nested(then, out)?;
                 if otherwise.is_empty() {
                     self.line(out, "}");
@@ -691,7 +691,7 @@ impl<'m> Writer<'m> {
                     if let Some(cond) = break_if {
                         let cond = self.expr(cond)?;
                         self.f.indent += 1;
-                        self.line(out, &format!("if ({cond}) {{ break; }}"));
+                        self.line(out, &format!("if ({}) {{ break; }}", unwrap_parens(&cond)));
                         self.f.indent -= 1;
                     }
                     self.line(out, "}");
@@ -1737,6 +1737,26 @@ impl<'m> Writer<'m> {
             vertex_buffer_base: buffers,
         })
     }
+}
+
+/// `text` without one pair of enclosing parentheses, when they enclose all of it. Metal rejects
+/// `if ((a == b))` as a likely typo for an assignment.
+fn unwrap_parens(text: &str) -> &str {
+    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return text;
+    };
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return text;
+        }
+    }
+    inner
 }
 
 /// A local's name: `_{name}_{index}`. Writer names never have an `_` before their digits, and
