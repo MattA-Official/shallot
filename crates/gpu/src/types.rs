@@ -1,6 +1,6 @@
 //! Enums, flags and descriptors, mirroring the WebGPU IDL with Rust naming.
 
-use crate::{Buffer, PipelineLayout, ShaderModule, TextureView};
+use crate::{BindGroupLayout, Buffer, PipelineLayout, Sampler, ShaderModule, TextureView};
 use std::ops::{BitAnd, BitOr, BitOrAssign};
 
 macro_rules! flags {
@@ -191,6 +191,109 @@ impl TextureFormat {
             Rgba32Uint | Rgba32Sint | Rgba32Float => 16,
             Depth24Plus | Depth24PlusStencil8 | Depth32FloatStencil8 => return None,
         })
+    }
+
+    /// Every format, in declaration order.
+    pub const ALL: [TextureFormat; 43] = {
+        use TextureFormat::*;
+        [
+            R8Unorm,
+            R8Snorm,
+            R8Uint,
+            R8Sint,
+            R16Uint,
+            R16Sint,
+            R16Float,
+            Rg8Unorm,
+            Rg8Snorm,
+            Rg8Uint,
+            Rg8Sint,
+            R32Uint,
+            R32Sint,
+            R32Float,
+            Rg16Uint,
+            Rg16Sint,
+            Rg16Float,
+            Rgba8Unorm,
+            Rgba8UnormSrgb,
+            Rgba8Snorm,
+            Rgba8Uint,
+            Rgba8Sint,
+            Bgra8Unorm,
+            Bgra8UnormSrgb,
+            Rgb10a2Uint,
+            Rgb10a2Unorm,
+            Rg11b10Ufloat,
+            Rgb9e5Ufloat,
+            Rg32Uint,
+            Rg32Sint,
+            Rg32Float,
+            Rgba16Uint,
+            Rgba16Sint,
+            Rgba16Float,
+            Rgba32Uint,
+            Rgba32Sint,
+            Rgba32Float,
+            Stencil8,
+            Depth16Unorm,
+            Depth24Plus,
+            Depth24PlusStencil8,
+            Depth32Float,
+            Depth32FloatStencil8,
+        ]
+    };
+
+    /// Parses the WebGPU spelling.
+    pub fn from_name(name: &str) -> Option<TextureFormat> {
+        TextureFormat::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// Whether a texture of this format can be bound with `sample_type`, as in WebGPU's
+    /// texture format capabilities table (the depth aspect of depth formats binds as `Depth`
+    /// or `UnfilterableFloat`).
+    pub fn supports_sample_type(self, sample_type: TextureSampleType) -> bool {
+        use TextureFormat::*;
+        use TextureSampleType as S;
+        match self {
+            R8Uint | R16Uint | Rg8Uint | R32Uint | Rg16Uint | Rgba8Uint | Rgb10a2Uint
+            | Rg32Uint | Rgba16Uint | Rgba32Uint | Stencil8 => sample_type == S::Uint,
+            R8Sint | R16Sint | Rg8Sint | R32Sint | Rg16Sint | Rgba8Sint | Rg32Sint | Rgba16Sint
+            | Rgba32Sint => sample_type == S::Sint,
+            // 32-bit floats are only filterable with the float32-filterable feature.
+            R32Float | Rg32Float | Rgba32Float => sample_type == S::UnfilterableFloat,
+            Depth16Unorm | Depth24Plus | Depth24PlusStencil8 | Depth32Float
+            | Depth32FloatStencil8 => matches!(sample_type, S::Depth | S::UnfilterableFloat),
+            _ => matches!(sample_type, S::Float | S::UnfilterableFloat),
+        }
+    }
+
+    /// Whether the format can be a storage texture with `access`: the core WebGPU set, with
+    /// `read-write` limited to the single-channel 32-bit formats.
+    pub fn supports_storage(self, access: StorageTextureAccess) -> bool {
+        use TextureFormat::*;
+        match access {
+            StorageTextureAccess::ReadWrite => matches!(self, R32Uint | R32Sint | R32Float),
+            _ => matches!(
+                self,
+                Rgba8Unorm
+                    | Rgba8Snorm
+                    | Rgba8Uint
+                    | Rgba8Sint
+                    | Rgba16Uint
+                    | Rgba16Sint
+                    | Rgba16Float
+                    | R32Uint
+                    | R32Sint
+                    | R32Float
+                    | Rg32Uint
+                    | Rg32Sint
+                    | Rg32Float
+                    | Rgba32Uint
+                    | Rgba32Sint
+                    | Rgba32Float
+                    | Bgra8Unorm
+            ),
+        }
     }
 
     /// The WebGPU spelling, such as `"rgba8unorm-srgb"`.
@@ -501,6 +604,8 @@ pub struct Limits {
     pub max_texture_array_layers: u32,
     pub max_bind_groups: u32,
     pub max_bindings_per_bind_group: u32,
+    pub max_dynamic_uniform_buffers_per_pipeline_layout: u32,
+    pub max_dynamic_storage_buffers_per_pipeline_layout: u32,
     pub max_sampled_textures_per_shader_stage: u32,
     pub max_samplers_per_shader_stage: u32,
     pub max_storage_buffers_per_shader_stage: u32,
@@ -534,6 +639,8 @@ impl Default for Limits {
             max_texture_array_layers: 256,
             max_bind_groups: 4,
             max_bindings_per_bind_group: 1000,
+            max_dynamic_uniform_buffers_per_pipeline_layout: 8,
+            max_dynamic_storage_buffers_per_pipeline_layout: 4,
             max_sampled_textures_per_shader_stage: 16,
             max_samplers_per_shader_stage: 16,
             max_storage_buffers_per_shader_stage: 8,
@@ -921,4 +1028,193 @@ pub struct SurfaceConfiguration {
     pub height: u32,
     pub present_mode: PresentMode,
     pub alpha_mode: CompositeAlphaMode,
+}
+
+// ------------------------------------------------------------------------------------------
+// Samplers
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AddressMode {
+    #[default]
+    ClampToEdge,
+    Repeat,
+    MirrorRepeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FilterMode {
+    #[default]
+    Nearest,
+    Linear,
+}
+
+/// `GPUMipmapFilterMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MipmapFilterMode {
+    #[default]
+    Nearest,
+    Linear,
+}
+
+#[derive(Debug, Clone)]
+pub struct SamplerDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub address_mode_u: AddressMode,
+    pub address_mode_v: AddressMode,
+    pub address_mode_w: AddressMode,
+    pub mag_filter: FilterMode,
+    pub min_filter: FilterMode,
+    pub mipmap_filter: MipmapFilterMode,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: f32,
+    pub compare: Option<CompareFunction>,
+    pub max_anisotropy: u16,
+}
+
+impl Default for SamplerDescriptor<'_> {
+    fn default() -> Self {
+        SamplerDescriptor {
+            label: None,
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            mipmap_filter: MipmapFilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 32.0,
+            compare: None,
+            max_anisotropy: 1,
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Bind group layouts and bind groups
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BufferBindingType {
+    #[default]
+    Uniform,
+    Storage,
+    ReadOnlyStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SamplerBindingType {
+    #[default]
+    Filtering,
+    NonFiltering,
+    Comparison,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextureSampleType {
+    #[default]
+    Float,
+    UnfilterableFloat,
+    Depth,
+    Sint,
+    Uint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StorageTextureAccess {
+    #[default]
+    WriteOnly,
+    ReadOnly,
+    ReadWrite,
+}
+
+/// The resource type of a `GPUBindGroupLayoutEntry`: exactly one of WebGPU's `buffer`,
+/// `sampler`, `texture` or `storageTexture` members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingType {
+    Buffer {
+        ty: BufferBindingType,
+        has_dynamic_offset: bool,
+        min_binding_size: u64,
+    },
+    Sampler(SamplerBindingType),
+    Texture {
+        sample_type: TextureSampleType,
+        view_dimension: TextureViewDimension,
+        multisampled: bool,
+    },
+    StorageTexture {
+        access: StorageTextureAccess,
+        format: TextureFormat,
+        view_dimension: TextureViewDimension,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindGroupLayoutEntry {
+    pub binding: u32,
+    pub visibility: ShaderStages,
+    pub ty: BindingType,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BindGroupLayoutDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub entries: &'a [BindGroupLayoutEntry],
+}
+
+/// `GPUBufferBinding`.
+#[derive(Clone)]
+pub struct BufferBinding<'a> {
+    pub buffer: &'a Buffer,
+    pub offset: u64,
+    /// `None` binds the rest of the buffer.
+    pub size: Option<u64>,
+}
+
+#[derive(Clone)]
+pub enum BindingResource<'a> {
+    Buffer(BufferBinding<'a>),
+    Sampler(&'a Sampler),
+    TextureView(&'a TextureView),
+}
+
+#[derive(Clone)]
+pub struct BindGroupEntry<'a> {
+    pub binding: u32,
+    pub resource: BindingResource<'a>,
+}
+
+#[derive(Clone)]
+pub struct BindGroupDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub layout: &'a BindGroupLayout,
+    pub entries: &'a [BindGroupEntry<'a>],
+}
+
+/// `GPUPipelineLayoutDescriptor`.
+#[derive(Clone, Default)]
+pub struct PipelineLayoutDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub bind_group_layouts: &'a [&'a BindGroupLayout],
+}
+
+// ------------------------------------------------------------------------------------------
+// Compute
+
+/// `GPUProgrammableStage`.
+#[derive(Clone)]
+pub struct ProgrammableStage<'a> {
+    pub module: &'a ShaderModule,
+    pub entry_point: Option<&'a str>,
+}
+
+#[derive(Clone)]
+pub struct ComputePipelineDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub layout: PipelineLayoutChoice<'a>,
+    pub compute: ProgrammableStage<'a>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ComputePassDescriptor<'a> {
+    pub label: Option<&'a str>,
 }

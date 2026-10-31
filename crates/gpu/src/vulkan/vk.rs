@@ -34,6 +34,9 @@ pub type PipelineLayout = u64;
 pub type Pipeline = u64;
 pub type PipelineCache = u64;
 pub type DescriptorSetLayout = u64;
+pub type DescriptorPool = u64;
+pub type DescriptorSet = u64;
+pub type Sampler = u64;
 pub type RenderPass = u64;
 pub type CommandPool = u64;
 pub type Fence = u64;
@@ -95,7 +98,13 @@ pub const STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO: i32 = 25;
 pub const STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: i32 = 26;
 pub const STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: i32 = 27;
 pub const STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: i32 = 28;
+pub const STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: i32 = 29;
 pub const STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: i32 = 30;
+pub const STRUCTURE_TYPE_SAMPLER_CREATE_INFO: i32 = 31;
+pub const STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: i32 = 32;
+pub const STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: i32 = 33;
+pub const STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: i32 = 34;
+pub const STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: i32 = 35;
 pub const STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: i32 = 39;
 pub const STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
 pub const STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
@@ -172,6 +181,7 @@ pub const IMAGE_LAYOUT_UNDEFINED: i32 = 0;
 pub const IMAGE_LAYOUT_GENERAL: i32 = 1;
 pub const IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: i32 = 2;
 pub const IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: i32 = 3;
+pub const IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: i32 = 4;
 pub const IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: i32 = 5;
 pub const IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: i32 = 6;
 pub const IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: i32 = 7;
@@ -193,6 +203,24 @@ pub const SHARING_MODE_EXCLUSIVE: i32 = 0;
 pub const COMPONENT_SWIZZLE_IDENTITY: i32 = 0;
 
 pub const PIPELINE_BIND_POINT_GRAPHICS: i32 = 0;
+pub const PIPELINE_BIND_POINT_COMPUTE: i32 = 1;
+
+pub const FILTER_NEAREST: i32 = 0;
+pub const FILTER_LINEAR: i32 = 1;
+pub const SAMPLER_MIPMAP_MODE_NEAREST: i32 = 0;
+pub const SAMPLER_MIPMAP_MODE_LINEAR: i32 = 1;
+pub const SAMPLER_ADDRESS_MODE_REPEAT: i32 = 0;
+pub const SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT: i32 = 1;
+pub const SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: i32 = 2;
+pub const BORDER_COLOR_FLOAT_TRANSPARENT_BLACK: i32 = 0;
+
+pub const DESCRIPTOR_TYPE_SAMPLER: i32 = 0;
+pub const DESCRIPTOR_TYPE_SAMPLED_IMAGE: i32 = 2;
+pub const DESCRIPTOR_TYPE_STORAGE_IMAGE: i32 = 3;
+pub const DESCRIPTOR_TYPE_UNIFORM_BUFFER: i32 = 6;
+pub const DESCRIPTOR_TYPE_STORAGE_BUFFER: i32 = 7;
+pub const DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: i32 = 8;
+pub const DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: i32 = 9;
 pub const COMMAND_BUFFER_LEVEL_PRIMARY: i32 = 0;
 pub const VERTEX_INPUT_RATE_VERTEX: i32 = 0;
 pub const VERTEX_INPUT_RATE_INSTANCE: i32 = 1;
@@ -1156,6 +1184,114 @@ pub struct PresentInfoKHR {
     pub p_results: *mut Result,
 }
 
+#[repr(C)]
+pub struct SamplerCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: Flags,
+    pub mag_filter: i32,
+    pub min_filter: i32,
+    pub mipmap_mode: i32,
+    pub address_mode_u: i32,
+    pub address_mode_v: i32,
+    pub address_mode_w: i32,
+    pub mip_lod_bias: f32,
+    pub anisotropy_enable: Bool32,
+    pub max_anisotropy: f32,
+    pub compare_enable: Bool32,
+    pub compare_op: i32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub border_color: i32,
+    pub unnormalized_coordinates: Bool32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorSetLayoutBinding {
+    pub binding: u32,
+    pub descriptor_type: i32,
+    pub descriptor_count: u32,
+    pub stage_flags: Flags,
+    pub p_immutable_samplers: *const Sampler,
+}
+
+#[repr(C)]
+pub struct DescriptorSetLayoutCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: Flags,
+    pub binding_count: u32,
+    pub p_bindings: *const DescriptorSetLayoutBinding,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorPoolSize {
+    pub descriptor_type: i32,
+    pub descriptor_count: u32,
+}
+
+#[repr(C)]
+pub struct DescriptorPoolCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: Flags,
+    pub max_sets: u32,
+    pub pool_size_count: u32,
+    pub p_pool_sizes: *const DescriptorPoolSize,
+}
+
+#[repr(C)]
+pub struct DescriptorSetAllocateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub descriptor_pool: DescriptorPool,
+    pub descriptor_set_count: u32,
+    pub p_set_layouts: *const DescriptorSetLayout,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorBufferInfo {
+    pub buffer: Buffer,
+    pub offset: DeviceSize,
+    pub range: DeviceSize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorImageInfo {
+    pub sampler: Sampler,
+    pub image_view: ImageView,
+    pub image_layout: i32,
+}
+
+#[repr(C)]
+pub struct WriteDescriptorSet {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub dst_set: DescriptorSet,
+    pub dst_binding: u32,
+    pub dst_array_element: u32,
+    pub descriptor_count: u32,
+    pub descriptor_type: i32,
+    pub p_image_info: *const DescriptorImageInfo,
+    pub p_buffer_info: *const DescriptorBufferInfo,
+    pub p_texel_buffer_view: *const c_void,
+}
+
+#[repr(C)]
+pub struct ComputePipelineCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: Flags,
+    pub stage: PipelineShaderStageCreateInfo,
+    pub layout: PipelineLayout,
+    pub base_pipeline_handle: Pipeline,
+    pub base_pipeline_index: i32,
+}
+
 pub type PFN_vkGetInstanceProcAddr =
     unsafe extern "system" fn(Instance, *const c_char) -> *const c_void;
 
@@ -1295,6 +1431,28 @@ fn_table!(DeviceFns {
         fn(CommandBuffer, Buffer, Image, i32, u32, *const BufferImageCopy);
     cmd_copy_image_to_buffer = "vkCmdCopyImageToBuffer":
         fn(CommandBuffer, Image, i32, Buffer, u32, *const BufferImageCopy);
+    create_sampler = "vkCreateSampler":
+        fn(Device, *const SamplerCreateInfo, *const c_void, *mut Sampler) -> Result;
+    destroy_sampler = "vkDestroySampler": fn(Device, Sampler, *const c_void);
+    create_descriptor_set_layout = "vkCreateDescriptorSetLayout":
+        fn(Device, *const DescriptorSetLayoutCreateInfo, *const c_void, *mut DescriptorSetLayout) -> Result;
+    destroy_descriptor_set_layout = "vkDestroyDescriptorSetLayout":
+        fn(Device, DescriptorSetLayout, *const c_void);
+    create_descriptor_pool = "vkCreateDescriptorPool":
+        fn(Device, *const DescriptorPoolCreateInfo, *const c_void, *mut DescriptorPool) -> Result;
+    destroy_descriptor_pool = "vkDestroyDescriptorPool": fn(Device, DescriptorPool, *const c_void);
+    allocate_descriptor_sets = "vkAllocateDescriptorSets":
+        fn(Device, *const DescriptorSetAllocateInfo, *mut DescriptorSet) -> Result;
+    update_descriptor_sets = "vkUpdateDescriptorSets":
+        fn(Device, u32, *const WriteDescriptorSet, u32, *const c_void);
+    create_compute_pipelines = "vkCreateComputePipelines":
+        fn(Device, PipelineCache, u32, *const ComputePipelineCreateInfo, *const c_void, *mut Pipeline) -> Result;
+    cmd_bind_descriptor_sets = "vkCmdBindDescriptorSets":
+        fn(CommandBuffer, i32, PipelineLayout, u32, u32, *const DescriptorSet, u32, *const u32);
+    cmd_dispatch = "vkCmdDispatch": fn(CommandBuffer, u32, u32, u32);
+    cmd_dispatch_indirect = "vkCmdDispatchIndirect": fn(CommandBuffer, Buffer, DeviceSize);
+    cmd_draw_indirect = "vkCmdDrawIndirect": fn(CommandBuffer, Buffer, DeviceSize, u32, u32);
+    cmd_draw_indexed_indirect = "vkCmdDrawIndexedIndirect": fn(CommandBuffer, Buffer, DeviceSize, u32, u32);
 });
 
 // Entry points promoted to core in Vulkan 1.3, loaded under their core or KHR names.
@@ -1417,5 +1575,15 @@ mod tests {
         assert_eq!(size_of::<StencilOpState>(), 28);
         assert_eq!(size_of::<FormatProperties>(), 12);
         assert_eq!(size_of::<ClearValue>(), 16);
+        assert_eq!(size_of::<SamplerCreateInfo>(), 80);
+        assert_eq!(size_of::<DescriptorSetLayoutBinding>(), 24);
+        assert_eq!(size_of::<DescriptorSetLayoutCreateInfo>(), 32);
+        assert_eq!(size_of::<DescriptorPoolSize>(), 8);
+        assert_eq!(size_of::<DescriptorPoolCreateInfo>(), 40);
+        assert_eq!(size_of::<DescriptorSetAllocateInfo>(), 40);
+        assert_eq!(size_of::<DescriptorBufferInfo>(), 24);
+        assert_eq!(size_of::<DescriptorImageInfo>(), 24);
+        assert_eq!(size_of::<WriteDescriptorSet>(), 64);
+        assert_eq!(size_of::<ComputePipelineCreateInfo>(), 96);
     }
 }
