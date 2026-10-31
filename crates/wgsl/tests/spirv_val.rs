@@ -1,11 +1,64 @@
-//! Compiles shaders to SPIR-V and checks the output with `spirv-val` when it is installed.
-//! `spirv-val` is a developer tool from SPIRV-Tools, run as a process, never linked.
+//! Compiles shaders to SPIR-V and MSL, and checks the output with `spirv-val` and Apple's
+//! Metal compiler when they are installed. Both are developer tools, run as processes, never
+//! linked. Setting `SHALLOT_REQUIRE_METAL` makes a missing Metal compiler a failure, for CI.
 
-use shallot_wgsl::{compile, SpirvOptions};
+use shallot_wgsl::{compile, Module, MslOptions, MslResource, MslSlot, SpirvOptions};
 use std::process::Command;
+
+fn validate_msl(name: &str, module: &Module) {
+    let output = module
+        .to_msl(&MslOptions::default())
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let dir = std::env::temp_dir().join("shallot-wgsl-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.metal"));
+    std::fs::write(&path, &output.source).unwrap();
+    let found = Command::new("xcrun")
+        .args(["-sdk", "macosx", "-f", "metal"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        if std::env::var_os("SHALLOT_REQUIRE_METAL").is_some() {
+            panic!("the Metal compiler is required but xcrun cannot find it");
+        }
+        eprintln!("Metal compiler not installed; skipping MSL validation of {name}");
+        return;
+    }
+    let air = dir.join(format!("{name}.air"));
+    let result = Command::new("xcrun")
+        .args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-std=macos-metal2.3",
+            "-Werror",
+            "-c",
+        ])
+        .arg(&path)
+        .arg("-o")
+        .arg(&air)
+        .output()
+        .unwrap();
+    if !result.status.success() {
+        panic!(
+            "{name} failed MSL compilation:\n{}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            numbered(&output.source)
+        );
+    }
+}
+
+fn numbered(source: &str) -> String {
+    source
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!("{:4} {l}\n", i + 1))
+        .collect()
+}
 
 fn validate(name: &str, source: &str) {
     let module = compile(source).unwrap_or_else(|e| panic!("{name}:\n{}", e.render(source)));
+    validate_msl(name, &module);
     let words = module
         .to_spirv(&SpirvOptions::default())
         .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -301,4 +354,140 @@ fn storage_textures() {
         }
         "#,
     );
+}
+
+#[test]
+fn msl_bindings_and_layouts() {
+    let source = r#"
+        struct Instance {
+            offset: vec3f,
+            scale: f32,
+            tint: vec3f,
+        }
+        struct Instances { count: u32, items: array<Instance> }
+        struct Camera { view_proj: mat4x4f, eye: vec3f }
+        struct Out {
+            @builtin(position) clip: vec4f,
+            @location(0) @interpolate(flat) id: u32,
+            @location(1) tint: vec3f,
+        }
+        struct FragOut {
+            @location(0) color: vec4f,
+            @builtin(frag_depth) depth: f32,
+        }
+
+        @group(1) @binding(3) var<storage, read> instances: Instances;
+        @group(0) @binding(0) var<uniform> camera: Camera;
+        @group(0) @binding(1) var tex: texture_2d<f32>;
+        @group(0) @binding(2) var samp: sampler;
+        @group(2) @binding(0) var<storage, read_write> hits: array<u32>;
+        var<private> calls: u32 = 1u;
+
+        fn instance(i: u32) -> Instance {
+            calls += 1u;
+            let n = arrayLength(&instances.items);
+            return instances.items[i % max(n, 1u)];
+        }
+
+        fn transform(p: vec3f, i: u32) -> vec4f {
+            let inst = instance(i);
+            return camera.view_proj * vec4f(p * inst.scale + inst.offset, 1.0);
+        }
+
+        @vertex
+        fn vs(@location(0) position: vec3f, @builtin(instance_index) i: u32) -> Out {
+            let inst = instance(i);
+            return Out(transform(position, i), i, inst.tint);
+        }
+
+        @fragment
+        fn fs(in: Out, @builtin(sample_mask) mask: u32) -> FragOut {
+            var total = vec3f(0.0);
+            var k = 0u;
+            loop {
+                k += 1u;
+                if k == 2u { continue; }
+                total += in.tint * f32(k);
+                continuing {
+                    break if k >= 4u;
+                }
+            }
+            hits[in.id] = hits[in.id] + countOneBits(mask);
+            let c = textureSample(tex, samp, in.clip.xy) * vec4f(total, 1.0);
+            return FragOut(c, in.clip.z);
+        }
+    "#;
+    validate("msl_bindings_and_layouts", source);
+
+    let module = compile(source).unwrap();
+    let msl = module.to_msl(&MslOptions::default()).unwrap();
+    assert_eq!(msl.buffer_sizes, vec![(1, 3), (2, 0)]);
+
+    let vs = msl.entry_point("vs").unwrap();
+    assert_eq!(vs.function, "ep_vs");
+    // Resources are numbered in (group, binding) order, per kind.
+    assert_eq!(
+        vs.resources,
+        vec![
+            MslResource {
+                group: 0,
+                binding: 0,
+                slot: MslSlot::Buffer(0)
+            },
+            MslResource {
+                group: 1,
+                binding: 3,
+                slot: MslSlot::Buffer(1)
+            },
+        ]
+    );
+    assert_eq!(vs.sizes_buffer, Some(2));
+    assert_eq!(vs.vertex_buffer_base, 3);
+
+    let fs = msl.entry_point("fs").unwrap();
+    assert_eq!(
+        fs.resources,
+        vec![
+            MslResource {
+                group: 0,
+                binding: 1,
+                slot: MslSlot::Texture(0)
+            },
+            MslResource {
+                group: 0,
+                binding: 2,
+                slot: MslSlot::Sampler(0)
+            },
+            MslResource {
+                group: 2,
+                binding: 0,
+                slot: MslSlot::Buffer(0)
+            },
+        ]
+    );
+    assert_eq!(fs.sizes_buffer, Some(1));
+
+    // WGSL's layout: `tint` sits at offset 16 of a 32-byte element, after 4 bytes of the
+    // struct's own padding, and `items` starts at 16.
+    assert!(msl.source.contains("packed_float3 offset_;\n    float scale_;\n    packed_float3 tint_;\n    char _pad_end[4];"), "{}", msl.source);
+    assert!(
+        msl.source
+            .contains("uint count_;\n    char _pad1[12];\n    Instance_ items_[1];"),
+        "{}",
+        msl.source
+    );
+    assert!(
+        msl.source.contains("((_buffer_sizes[0] - 16u) / 32u)"),
+        "{}",
+        msl.source
+    );
+}
+
+#[test]
+fn msl_point_size() {
+    let module = compile(include_str!("../../gpu/examples/triangle.wgsl")).unwrap();
+    let plain = module.to_msl(&MslOptions::default()).unwrap();
+    let points = module.to_msl(&MslOptions { point_size: true }).unwrap();
+    assert!(!plain.source.contains("[[point_size]]"));
+    assert!(points.source.contains("float _point_size [[point_size]];"));
 }
