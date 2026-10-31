@@ -94,6 +94,23 @@ impl Surface {
                     "vkCreateWin32SurfaceKHR",
                 )?;
             }
+            RawWindowHandle::AppKit { ca_metal_layer, .. } => {
+                let Some(metal) = &instance.metal_surface else {
+                    return Err(GpuError::Internal(
+                        "the Vulkan driver does not support Metal surfaces".into(),
+                    ));
+                };
+                let info = vk::MetalSurfaceCreateInfoEXT {
+                    s_type: vk::STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
+                    p_next: std::ptr::null(),
+                    flags: 0,
+                    p_layer: ca_metal_layer,
+                };
+                check(
+                    (metal.create_metal_surface)(instance.raw, &info, std::ptr::null(), &mut raw),
+                    "vkCreateMetalSurfaceEXT",
+                )?;
+            }
         }
         Ok(Surface {
             shared: Arc::new(SurfaceShared {

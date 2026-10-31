@@ -66,6 +66,8 @@ Status: window, keyboard (scan codes, text with surrogate pairs), mouse buttons 
 - Audio: Core Audio `AudioUnit` (`kAudioUnitSubType_DefaultOutput`) render callback.
 - Surface: `CAMetalLayer` for the Metal backend.
 
+Status: window, keyboard (virtual key codes, modifiers from `FlagsChanged`, text), mouse buttons, wheel (precise trackpad deltas scaled to lines), enter/leave, focus, resize and the layer-backed view are in `crates/platform/src/cocoa.rs`, with `libobjc`, AppKit, Foundation and QuartzCore loaded at run time. Rather than subclassing `NSApplication` or `NSView`, it drains the event queue with `nextEventMatchingMask:untilDate:inMode:dequeue:` inside `poll_events`, translates the events for its window and forwards all but key events to `sendEvent:`; a runtime-defined delegate class answers `windowShouldClose:`, and size and focus are compared on each poll. Windows must be created on the main thread, so the window test is a `harness = false` test with its own `main`. Until the Metal backend lands (gpu.md F8), the GPU layer presents through MoltenVK: `VK_EXT_metal_surface` on the view's `CAMetalLayer`, with `VK_KHR_portability_enumeration` so the loader lists MoltenVK. CI runs lints, tests and the triangle on `macos-15` with Homebrew's `vulkan-loader` and `molten-vk`. Pointer lock, `CADisplayLink` pacing, the device-pixel-ratio event and audio follow with step 6 below.
+
 ### Linux
 
 - X11 first (works everywhere, including XWayland), then native Wayland. Both loaded with `dlopen` so a binary runs on either.

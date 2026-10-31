@@ -161,6 +161,76 @@ fn expressions() {
     );
 }
 
+/// The string operands of every `OpName`.
+fn debug_names(words: &[u32]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut i = 5;
+    while i < words.len() {
+        let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+        if opcode == 5 {
+            let bytes: Vec<u8> = words[i + 2..i + count]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .take_while(|&b| b != 0)
+                .collect();
+            names.push(String::from_utf8(bytes).unwrap());
+        }
+        i += count.max(1);
+    }
+    names
+}
+
+/// MoltenVK translates SPIR-V to MSL with SPIRV-Cross, which names functions after `OpName`. An
+/// entry point's body named like the entry point itself becomes a second MSL function of the
+/// same name, and Metal rejects the pipeline.
+#[test]
+fn entry_point_bodies_are_not_named_like_their_entry_points() {
+    let module = compile(include_str!("../../gpu/examples/triangle.wgsl")).unwrap();
+    let names = debug_names(&module.to_spirv(&SpirvOptions::default()).unwrap());
+    for entry in ["vs_main", "fs_main"] {
+        assert!(!names.iter().any(|n| n == entry), "{names:?}");
+        assert!(names.contains(&format!("{entry}_body")), "{names:?}");
+    }
+}
+
+/// Vulkan forbids explicit layouts outside buffers (VUID-StandaloneSpirv-None-10684), so a
+/// workgroup array carries no `ArrayStride`, while a storage buffer's array does.
+#[test]
+fn only_buffer_types_have_explicit_layouts() {
+    let strides = |source: &str| {
+        let words = compile(source)
+            .unwrap()
+            .to_spirv(&SpirvOptions::default())
+            .unwrap();
+        let mut count = 0;
+        let mut i = 5;
+        while i < words.len() {
+            let (len, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+            // OpDecorate %id ArrayStride
+            if opcode == 71 && words[i + 2] == 6 {
+                count += 1;
+            }
+            i += len.max(1);
+        }
+        count
+    };
+    let workgroup = r#"
+        var<workgroup> scratch: array<f32, 64>;
+        @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32) {
+            scratch[i] = f32(i);
+        }
+    "#;
+    assert_eq!(strides(workgroup), 0);
+    let storage = r#"
+        @group(0) @binding(0) var<storage, read_write> data: array<f32, 64>;
+        @compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32) {
+            data[i] = f32(i);
+        }
+    "#;
+    assert_eq!(strides(storage), 1);
+    validate("workgroup_array", workgroup);
+}
+
 #[test]
 fn textures_and_samplers() {
     validate(

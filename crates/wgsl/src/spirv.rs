@@ -30,6 +30,37 @@ impl Module {
     }
 }
 
+/// Every type a uniform or storage buffer holds, through struct members and array elements.
+/// A type that is also used elsewhere (a workgroup array of the same type, a local copy of a
+/// buffer struct) shares the laid-out SPIR-V type; separating those needs a second, layout-free
+/// type and member-wise copies, which this writer does not do yet.
+fn laid_out_types(module: &Module) -> std::collections::HashSet<Type> {
+    fn visit(ty: &Type, module: &Module, out: &mut std::collections::HashSet<Type>) {
+        let ty = if ty.is_abstract() {
+            ty.concretize()
+        } else {
+            ty.clone()
+        };
+        match &ty {
+            Type::Array { element, .. } => visit(element, module, out),
+            Type::Struct(i) => {
+                for member in &module.structs[*i].members {
+                    visit(&member.ty, module, out);
+                }
+            }
+            _ => {}
+        }
+        out.insert(ty);
+    }
+    let mut out = std::collections::HashSet::new();
+    for global in &module.globals {
+        if matches!(global.space, AddressSpace::Uniform | AddressSpace::Storage) {
+            visit(&global.ty, module, &mut out);
+        }
+    }
+    out
+}
+
 fn unsupported<T>(what: &str) -> Result<T> {
     Err(Error::new(
         format!("{what} is not supported by the SPIR-V back end yet"),
@@ -418,6 +449,9 @@ struct Writer<'m> {
     current_fn: usize,
     /// Struct types already decorated `Block`.
     blocks: BTreeSet<u32>,
+    /// Types reachable from uniform and storage buffers, the only ones given an explicit
+    /// layout: Vulkan forbids `Offset` and `ArrayStride` on types in other storage classes.
+    laid_out: std::collections::HashSet<Type>,
     /// `OpTypeSampledImage` for each image type.
     sampled_images: HashMap<u32, u32>,
     f: FnState,
@@ -445,6 +479,7 @@ impl<'m> Writer<'m> {
             function_ids: Vec::new(),
             current_fn: 0,
             blocks: BTreeSet::new(),
+            laid_out: laid_out_types(module),
             sampled_images: HashMap::new(),
             f: FnState::default(),
         }
@@ -605,7 +640,7 @@ impl<'m> Writer<'m> {
                         &[id, element_id],
                     ),
                 }
-                if element.is_host_shareable(&self.module.structs) {
+                if self.laid_out.contains(&ty) {
                     let stride = array_stride(element, &self.module.structs);
                     self.decorate(id, decoration::ARRAY_STRIDE, &[stride]);
                 }
@@ -623,7 +658,7 @@ impl<'m> Writer<'m> {
                 operands.extend(&members);
                 encode(&mut self.declarations, op::TYPE_STRUCT, &operands);
                 self.name(id, &st.name.clone());
-                let shareable = ty.is_host_shareable(&self.module.structs);
+                let shareable = self.laid_out.contains(&ty);
                 for (m, member) in st.members.iter().enumerate() {
                     if self.options.debug_names {
                         let mut operands = vec![id, m as u32];
@@ -877,7 +912,14 @@ impl<'m> Writer<'m> {
             .collect::<Result<_>>()?;
         let fn_type = self.function_type(ret, &param_types);
         let id = self.function_ids[index];
-        self.name(id, &function.name);
+        // An entry point's body is called by a wrapper that carries the WGSL name. Naming both
+        // alike makes SPIRV-Cross (MoltenVK) emit two MSL functions of the same name and
+        // parameters, which Metal rejects.
+        if self.module.entry_points.iter().any(|e| e.function == index) {
+            self.name(id, &format!("{}_body", function.name));
+        } else {
+            self.name(id, &function.name);
+        }
         self.current_fn = index;
 
         let mut head = Vec::new();

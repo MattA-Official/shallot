@@ -45,6 +45,7 @@ pub(crate) struct InstanceShared {
     pub surface: Option<vk::SurfaceFns>,
     pub xlib_surface: Option<vk::XlibSurfaceFns>,
     pub win32_surface: Option<vk::Win32SurfaceFns>,
+    pub metal_surface: Option<vk::MetalSurfaceFns>,
     pub api_version: u32,
 }
 
@@ -66,7 +67,14 @@ pub struct Instance {
 const LOADER_NAMES: &[&str] = if cfg!(windows) {
     &["vulkan-1.dll"]
 } else if cfg!(target_os = "macos") {
-    &["libvulkan.1.dylib", "libMoltenVK.dylib"]
+    &[
+        "libvulkan.1.dylib",
+        "/opt/homebrew/lib/libvulkan.1.dylib",
+        "/usr/local/lib/libvulkan.1.dylib",
+        "libMoltenVK.dylib",
+        "/opt/homebrew/lib/libMoltenVK.dylib",
+        "/usr/local/lib/libMoltenVK.dylib",
+    ]
 } else {
     &["libvulkan.so.1", "libvulkan.so"]
 };
@@ -125,6 +133,10 @@ impl Instance {
                 c"VK_KHR_surface",
                 c"VK_KHR_xlib_surface",
                 c"VK_KHR_win32_surface",
+                c"VK_EXT_metal_surface",
+                // MoltenVK is a portability implementation, which the loader lists only when
+                // asked to.
+                c"VK_KHR_portability_enumeration",
             ];
             for &name in wanted {
                 if has(name) {
@@ -164,10 +176,15 @@ impl Instance {
                 engine_version: 0,
                 api_version,
             };
+            let flags = if extensions.contains(&c"VK_KHR_portability_enumeration") {
+                vk::INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+            } else {
+                0
+            };
             let info = vk::InstanceCreateInfo {
                 s_type: vk::STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                 p_next: std::ptr::null(),
-                flags: 0,
+                flags,
                 p_application_info: &app,
                 enabled_layer_count: layer_ptrs.len() as u32,
                 pp_enabled_layer_names: layer_ptrs.as_ptr(),
@@ -197,6 +214,11 @@ impl Instance {
             } else {
                 None
             };
+            let metal_surface = if extensions.contains(&c"VK_EXT_metal_surface") {
+                vk::MetalSurfaceFns::load(load).ok()
+            } else {
+                None
+            };
             Ok(Instance {
                 shared: Arc::new(InstanceShared {
                     _library: library,
@@ -205,6 +227,7 @@ impl Instance {
                     surface,
                     xlib_surface,
                     win32_surface,
+                    metal_surface,
                     api_version,
                 }),
             })
